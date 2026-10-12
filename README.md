@@ -39,7 +39,7 @@ substack --help
 - **Read (no auth):** list the archive, fetch a single post, pull the RSS feed.
 - **Search & discovery:** search a publication's archive, list categories and sections, and pull cross-publication category leaderboards (top 25 publications by paid subscribers, total reach, or growth — no auth needed).
 - **Publishing:** create / edit / delete drafts, publish or schedule posts, upload images (Markdown → ProseMirror conversion).
-- **Moderation:** manage comments and reactions.
+- **Moderation:** manage comments and reactions — create, delete, react, report spam/impersonation, ban commenters, and look up existing bans.
 - **Notes:** create, list, read, and delete Substack Notes (no edit — the API has no note-update endpoint; notes publish immediately).
 - **Audience:** manage subscribers, cross-publication recommendations, and post tags.
 - **Analytics:** per-post and publication-level stats.
@@ -93,6 +93,141 @@ pytest -q          # 234 tests, all HTTP mocked — no real network calls
 ```
 
 Architecture, auth model, two-host routing, and a guide to adding new endpoints live in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). The API surface is mapped in [`skills/substack/references/substack-api.md`](skills/substack/references/substack-api.md).
+
+## Comment-moderation commands
+
+These commands target scam/impersonation accounts (e.g. "Charlie WhatsApp" reply-
+bots). All write commands require `SUBSTACK_ENABLE_WRITE=true` and **default to
+dry-run** — they print the exact HTTP request without firing it. Add `--no-dry-run`
+(alias `--yes`) to execute.
+
+### Report a comment
+
+```bash
+# Dry-run (default) — print request only
+substack comments report <COMMENT_ID> \
+  --category spam \
+  --details "Impersonation scam: Charlie WhatsApp +1672..."
+
+# Execute for real
+substack comments report <COMMENT_ID> \
+  --category impersonation \
+  --details "Fake Charlie account soliciting DMs" \
+  --no-dry-run
+```
+
+`--category` values (from Substack's reporting flow):
+`spam`, `impersonation`, `hate`, `private_information`, `plagiarism`,
+`illegal_activity`, `pornography`, `other`.
+
+`--to-substack` / `--no-to-substack`: whether to also escalate to Substack
+Trust & Safety (default: `--to-substack`).
+
+### Report a user profile
+
+```bash
+substack comments report-user <USER_ID> \
+  --category impersonation \
+  --details "Impersonating Charlie Garcia to solicit readers" \
+  --no-dry-run
+```
+
+Routes to `POST https://substack.com/api/v1/users/{user_id}/profile/report`
+with `surface: "profile"`.
+
+### Ban a commenter
+
+```bash
+# Dry-run
+substack comments ban <COMMENT_ID> \
+  --user-id <USER_ID> \
+  --expiry "2027-10-12T00:00:00Z" \
+  --visibility visible
+
+# Execute — 1-year ban, keep comments visible
+substack comments ban <COMMENT_ID> \
+  --user-id <USER_ID> \
+  --expiry "2027-10-12T00:00:00Z" \
+  --no-dry-run
+
+# Permanent ban + delete all comments
+substack comments ban <COMMENT_ID> \
+  --user-id <USER_ID> \
+  --expiry "2126-10-12T00:00:00Z" \
+  --visibility delete_all_comments \
+  --no-dry-run
+```
+
+`--expiry`: ISO-8601 datetime. Common durations:
+- 1 day: `$(date -u -v+1d +%Y-%m-%dT%H:%M:%SZ)` (macOS)
+- 30 days: `$(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)`
+- 1 year: `$(date -u -v+1y +%Y-%m-%dT%H:%M:%SZ)`
+- Permanent: `2126-10-12T00:00:00Z` (>100 years, what Substack's UI uses)
+
+`--visibility` enum (confirmed from Substack web bundle):
+- `visible` *(default)* — keep the user's existing comments
+- `delete_all_comments` — delete all their comments on ban
+
+> **Note:** Substack's UI reloads the page when `commentVisibility ≠ "visible"`,
+> suggesting server-side comment deletion happens asynchronously.
+
+### Look up existing bans for a user (read-only)
+
+```bash
+substack comments bans <USER_ID>
+```
+
+### Fetch report category tree (read-only)
+
+```bash
+substack moderation report-categories --pretty
+```
+
+### Fetch comment deletion reason codes (read-only)
+
+```bash
+substack moderation delete-reasons --pretty
+```
+
+### Recommended first smoke-test for a known scam comment
+
+Replace `<COMMENT_ID>` and `<USER_ID>` with values from `substack comments list`:
+
+```bash
+# Step 1 — dry-run report (no write occurs)
+SUBSTACK_ENABLE_WRITE=true substack comments report <COMMENT_ID> \
+  --category impersonation \
+  --details "Scam account impersonating Charlie Garcia, soliciting WhatsApp contact"
+
+# Step 2 — inspect the printed JSON, then fire for real
+SUBSTACK_ENABLE_WRITE=true substack comments report <COMMENT_ID> \
+  --category impersonation \
+  --details "Scam account impersonating Charlie Garcia, soliciting WhatsApp contact" \
+  --no-dry-run
+
+# Step 3 — dry-run ban
+SUBSTACK_ENABLE_WRITE=true substack comments ban <COMMENT_ID> \
+  --user-id <USER_ID> \
+  --expiry "2126-10-12T00:00:00Z" \
+  --visibility delete_all_comments
+
+# Step 4 — execute ban
+SUBSTACK_ENABLE_WRITE=true substack comments ban <COMMENT_ID> \
+  --user-id <USER_ID> \
+  --expiry "2126-10-12T00:00:00Z" \
+  --visibility delete_all_comments \
+  --no-dry-run
+```
+
+### Unverified / open questions
+
+| Item | Status |
+|------|--------|
+| `report_context` body shape | Not found in bundle. Field accepted as optional `--report-context <JSON>` string; omit in most cases. |
+| `expiry` format | Inferred as ISO-8601 datetime from bundle's `isAfter()` comparison. Not live-verified. |
+| `commentVisibility` enum | Confirmed `"visible"` and `"delete_all_comments"` from bundle toggle logic. |
+| Host for comment report | Publication host (`charliepgarcia.substack.com`). Notes UI uses `substack.com` — if a comment is on Notes, the CLI may need `--host A` (not yet exposed). |
+| Profile report live response shape | Unknown; the endpoint exists per bundle but has not been called with real credentials. |
 
 ## License
 
