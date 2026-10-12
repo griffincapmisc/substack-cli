@@ -44,6 +44,12 @@ research (all ~55 discovered endpoints), see
 | `comments delete` | DELETE | `/api/v1/comment/{id}` | A or P | Yes | Confirmed (2+) | Accepts host override |
 | `comments react` | POST | `/api/v1/post/{id}/reaction` | P | Yes | Single source | Body: `{"reaction": "❤", "surface": "reader"}` — **literal emoji**, not "like" |
 | `comments unreact` | DELETE | `/api/v1/post/{id}/reaction` | P | Yes | Single source | — |
+| `comments report` | POST | `/api/v1/comment/{id}/report` | P | Yes | Bundle-derived, not live-verified | Dry-run by default; requires `SUBSTACK_ENABLE_WRITE`. Body: `{reportCategory, details, reportedToSubstack, publication_id?}`. `reportCategory` enum: spam/impersonation/hate/private_information/plagiarism/illegal_activity/pornography/other. `publication_id` optional — no resolver; supply via `--publication-id`. |
+| `comments report-user` | POST | `/api/v1/users/{id}/profile/report` | A | Yes | Bundle-derived, not live-verified | Dry-run by default; requires `SUBSTACK_ENABLE_WRITE`. Body: `{reportCategory, details, reportedToSubstack, surface:"profile"}`. Uses bare substack.com host (Host A). |
+| `comments ban` | POST | `/api/v1/comment_ban/{comment_id}` | P | Yes | Bundle-derived, not live-verified | Dry-run by default; requires `SUBSTACK_ENABLE_WRITE`. Body: `{user_id, expiry, commentVisibility}`. `expiry` enum: 1d/30d/90d/1y/1000y (1000y = Forever). `commentVisibility` enum: visible/delete_this_comment/delete_all_comments. `delete_all_comments` is irreversible. |
+| `comments bans` | GET | `/api/v1/user/{id}/bans` | P | Yes | Bundle-derived, not live-verified | Read-only. |
+| `moderation report-categories` | GET | `/api/v1/reporting/flows` | A | Yes | Bundle-derived, not live-verified | Read-only. Uses bare substack.com host (Host A). Returns the full reportCategory tree. |
+| `moderation delete-reasons` | GET | `/api/v1/comment/moderation/delete_reasons` | P | Yes | Bundle-derived, not live-verified | Read-only. |
 | `subscribers add` | POST | `/api/v1/subscriber/add` | P | Yes | Single source | Body: `{"email": "...", "name": "..."}` |
 | `subscribers remove` | DELETE | `/api/v1/subscriber/{id}` | P | Yes | Single source | — |
 | `recommendations add` | PUT | `/api/v1/recommendations` | P | Yes | Single source | **Browser-vs-curl gap**: may 403 even with valid cookies |
