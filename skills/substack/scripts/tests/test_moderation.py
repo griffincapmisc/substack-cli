@@ -15,6 +15,7 @@ from substack_cli.moderation import (
     report_comment,
     report_user_profile,
     VALID_CATEGORIES,
+    VALID_EXPIRIES,
     VALID_VISIBILITIES,
 )
 
@@ -187,14 +188,14 @@ def test_ban_commenter_posts_correct_body(
         client,
         comment_id=555,
         user_id=777,
-        expiry="2027-10-12T00:00:00Z",
+        expiry="1y",
         comment_visibility="visible",
     )
 
     assert route.called
     body = json.loads(route.calls[0].request.content)
     assert body["user_id"] == 777
-    assert body["expiry"] == "2027-10-12T00:00:00Z"
+    assert body["expiry"] == "1y"
     assert body["commentVisibility"] == "visible"
 
 
@@ -211,7 +212,7 @@ def test_ban_commenter_delete_all_comments_visibility(
         client,
         comment_id=600,
         user_id=888,
-        expiry="2126-10-12T00:00:00Z",
+        expiry="1000y",
         comment_visibility="delete_all_comments",
     )
 
@@ -224,7 +225,7 @@ def test_ban_commenter_rejects_invalid_visibility(
 ):
     client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
     with pytest.raises(ValueError, match="Invalid commentVisibility"):
-        ban_commenter(client, 1, 2, "2027-01-01T00:00:00Z", "hide")
+        ban_commenter(client, 1, 2, "1y", "hide")
 
 
 def test_ban_commenter_requires_write_gate(
@@ -232,7 +233,7 @@ def test_ban_commenter_requires_write_gate(
 ):
     client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
     with pytest.raises(ValueError, match="SUBSTACK_ENABLE_WRITE"):
-        ban_commenter(client, 1, 2, "2027-01-01T00:00:00Z", "visible")
+        ban_commenter(client, 1, 2, "1y", "visible")
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +345,7 @@ def test_comments_ban_dry_run_prints_request(
         [
             "ban", "555",
             "--user-id", "777",
-            "--expiry", "2027-10-12T00:00:00Z",
+            "--expiry", "1y",
             "--visibility", "visible",
         ],
     )
@@ -353,7 +354,7 @@ def test_comments_ban_dry_run_prints_request(
     assert data["dry_run"] is True
     assert "555" in data["url"]
     assert data["body"]["user_id"] == 777
-    assert data["body"]["expiry"] == "2027-10-12T00:00:00Z"
+    assert data["body"]["expiry"] == "1y"
     assert data["body"]["commentVisibility"] == "visible"
 
 
@@ -365,7 +366,7 @@ def test_comments_ban_dry_run_delete_all_visibility(
         [
             "ban", "600",
             "--user-id", "888",
-            "--expiry", "2126-10-12T00:00:00Z",
+            "--expiry", "1000y",
             "--visibility", "delete_all_comments",
         ],
     )
@@ -390,7 +391,7 @@ def test_comments_ban_blocked_without_write_gate(
 ):
     result = cli_runner.invoke(
         comments_app,
-        ["ban", "555", "--user-id", "777", "--expiry", "2027-01-01T00:00:00Z"],
+        ["ban", "555", "--user-id", "777", "--expiry", "1y"],
     )
     assert result.exit_code != 0
 
@@ -413,7 +414,7 @@ def test_comments_ban_rejects_bad_visibility(
         [
             "ban", "555",
             "--user-id", "777",
-            "--expiry", "2027-01-01T00:00:00Z",
+            "--expiry", "1y",
             "--visibility", "bad_value",
         ],
     )
@@ -433,5 +434,33 @@ def test_valid_categories_set():
 
 def test_valid_visibilities_set():
     assert "visible" in VALID_VISIBILITIES
+    assert "delete_this_comment" in VALID_VISIBILITIES
     assert "delete_all_comments" in VALID_VISIBILITIES
-    assert len(VALID_VISIBILITIES) == 2
+    assert len(VALID_VISIBILITIES) == 3
+
+
+def test_valid_expiries_match_bundle():
+    assert VALID_EXPIRIES == {"1d", "30d", "90d", "1y", "1000y"}
+
+
+def test_ban_commenter_rejects_iso_expiry(monkeypatch):
+    """Substack's ban modal posts duration codes, not datetimes."""
+    import pytest
+    from unittest.mock import MagicMock
+    from substack_cli import moderation as m
+    monkeypatch.setattr(m, "is_write_enabled", lambda: True)
+    client = MagicMock()
+    with pytest.raises(ValueError, match="Invalid expiry"):
+        m.ban_commenter(client, 1, 2, "2027-10-12T00:00:00Z", "visible")
+    client.post.assert_not_called()
+
+
+def test_comments_ban_cli_rejects_bad_expiry(monkeypatch):
+    from typer.testing import CliRunner
+    from substack_cli.app import app
+    monkeypatch.setenv("SUBSTACK_ENABLE_WRITE", "true")
+    result = CliRunner().invoke(
+        app, ["comments", "ban", "555", "--user-id", "777", "--expiry", "forever"]
+    )
+    assert result.exit_code != 0
+    assert "Invalid --expiry" in result.output

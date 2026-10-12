@@ -141,32 +141,29 @@ with `surface: "profile"`.
 # Dry-run
 substack comments ban <COMMENT_ID> \
   --user-id <USER_ID> \
-  --expiry "2027-10-12T00:00:00Z" \
+  --expiry 1y \
   --visibility visible
 
 # Execute — 1-year ban, keep comments visible
 substack comments ban <COMMENT_ID> \
   --user-id <USER_ID> \
-  --expiry "2027-10-12T00:00:00Z" \
+  --expiry 1y \
   --no-dry-run
 
 # Permanent ban + delete all comments
 substack comments ban <COMMENT_ID> \
   --user-id <USER_ID> \
-  --expiry "2126-10-12T00:00:00Z" \
+  --expiry 1000y \
   --visibility delete_all_comments \
   --no-dry-run
 ```
 
-`--expiry`: ISO-8601 datetime. Common durations:
-- 1 day: `$(date -u -v+1d +%Y-%m-%dT%H:%M:%SZ)` (macOS)
-- 30 days: `$(date -u -v+30d +%Y-%m-%dT%H:%M:%SZ)`
-- 1 year: `$(date -u -v+1y +%Y-%m-%dT%H:%M:%SZ)`
-- Permanent: `2126-10-12T00:00:00Z` (>100 years, what Substack's UI uses)
+`--expiry` enum (confirmed from Substack's ban modal): `1d`, `30d`, `90d`, `1y`, `1000y` (`1000y` = "Forever").
 
 `--visibility` enum (confirmed from Substack web bundle):
-- `visible` *(default)* — keep the user's existing comments
-- `delete_all_comments` — delete all their comments on ban
+- `visible` *(default)*: keep the user's existing comments
+- `delete_this_comment`: delete only the comment you are banning from
+- `delete_all_comments`: delete all of their comments on this publication (irreversible)
 
 > **Note:** Substack's UI reloads the page when `commentVisibility ≠ "visible"`,
 > suggesting server-side comment deletion happens asynchronously.
@@ -208,13 +205,13 @@ SUBSTACK_ENABLE_WRITE=true substack comments report <COMMENT_ID> \
 # Step 3 — dry-run ban
 SUBSTACK_ENABLE_WRITE=true substack comments ban <COMMENT_ID> \
   --user-id <USER_ID> \
-  --expiry "2126-10-12T00:00:00Z" \
+  --expiry 1000y \
   --visibility delete_all_comments
 
 # Step 4 — execute ban
 SUBSTACK_ENABLE_WRITE=true substack comments ban <COMMENT_ID> \
   --user-id <USER_ID> \
-  --expiry "2126-10-12T00:00:00Z" \
+  --expiry 1000y \
   --visibility delete_all_comments \
   --no-dry-run
 ```
@@ -224,8 +221,8 @@ SUBSTACK_ENABLE_WRITE=true substack comments ban <COMMENT_ID> \
 | Item | Status |
 |------|--------|
 | `report_context` body shape | Not found in bundle. Field accepted as optional `--report-context <JSON>` string; omit in most cases. |
-| `expiry` format | Inferred as ISO-8601 datetime from bundle's `isAfter()` comparison. Not live-verified. |
-| `commentVisibility` enum | Confirmed `"visible"` and `"delete_all_comments"` from bundle toggle logic. |
+| `expiry` format | Confirmed enum `1d`/`30d`/`90d`/`1y`/`1000y` from the ban modal's select options. Not yet live-verified. |
+| `commentVisibility` enum | Confirmed `visible` / `delete_this_comment` / `delete_all_comments` from the ban modal's select options. |
 | Host for comment report | Publication host (`charliepgarcia.substack.com`). Notes UI uses `substack.com` — if a comment is on Notes, the CLI may need `--host A` (not yet exposed). |
 | Profile report live response shape | Unknown; the endpoint exists per bundle but has not been called with real credentials. |
 

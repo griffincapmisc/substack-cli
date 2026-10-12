@@ -21,14 +21,16 @@ Endpoint notes (reverse-engineered from Substack web bundle):
                                 report_context}
   • ban:                 POST /api/v1/comment_ban/{comment_id}
                          body: {user_id, expiry, commentVisibility}
-    commentVisibility enum (confirmed from bundle):
-        "visible"              — keep comments visible
-        "delete_all_comments"  — delete all user's comments
-    expiry format: ISO-8601 datetime string (e.g. "2027-10-12T00:00:00Z");
-        the bundle shows the UI passing an expiry value from a select whose
-        result is later compared with isAfter(), confirming ISO datetime.
-        Common durations: +1d, +30d, +90d, +365d, or a far-future date for
-        "permanent" (bundle shows expiry > now()+100years → "permanently banned").
+    commentVisibility enum (confirmed from bundle module 5646, the ban
+    modal's "comment_visibility" <select>):
+        "visible"              — "Do not delete comments"
+        "delete_this_comment"  — "Delete this comment"
+        "delete_all_comments"  — "Also delete all comments" (irreversible)
+    expiry enum (confirmed from bundle module 92538, the ban modal's
+    "expiry" <select>; the UI posts the option value verbatim):
+        "1d" | "30d" | "90d" | "1y" | "1000y"   ("1000y" is labelled "Forever")
+        The server returns the ban with an absolute expiry datetime, which is
+        what the UI later compares with isAfter().
   • report_context:  shape not found in bundle; accepted as optional JSON
                      string; omit or pass null and the API ignores it.
 """
@@ -80,8 +82,12 @@ VALID_CATEGORIES = {
     "other",
 }
 
-# commentVisibility values confirmed from bundle (ban UI toggle)
-VALID_VISIBILITIES = {"visible", "delete_all_comments"}
+# commentVisibility values confirmed from bundle module 5646 (ban modal select)
+VALID_VISIBILITIES = {"visible", "delete_this_comment", "delete_all_comments"}
+
+# expiry values confirmed from bundle module 92538 (ban modal "Ban duration"
+# select). "1000y" is the UI's "Forever".
+VALID_EXPIRIES = {"1d", "30d", "90d", "1y", "1000y"}
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +199,10 @@ def ban_commenter(
         raise ValueError(
             f"Invalid commentVisibility {comment_visibility!r}. "
             f"Must be one of: {sorted(VALID_VISIBILITIES)}"
+        )
+    if expiry not in VALID_EXPIRIES:
+        raise ValueError(
+            f"Invalid expiry {expiry!r}. Must be one of: {sorted(VALID_EXPIRIES)}"
         )
     body: dict = {
         "user_id": user_id,
@@ -394,9 +404,8 @@ def comments_ban_cmd(
         "--expiry",
         "-e",
         help=(
-            "Ban expiry as ISO-8601 datetime string, e.g. "
-            "2027-10-12T00:00:00Z for ~1 year, "
-            "or 2126-10-12T00:00:00Z for permanent."
+            "Ban duration: one of 1d, 30d, 90d, 1y, 1000y "
+            "(1000y = Substack's 'Forever')."
         ),
     ),
     visibility: str = typer.Option(
@@ -405,7 +414,8 @@ def comments_ban_cmd(
         help=(
             "Comment visibility after ban. "
             "'visible' (default) keeps comments; "
-            "'delete_all_comments' removes them. "
+            "'delete_this_comment' removes only this comment; "
+            "'delete_all_comments' removes all of the user's comments (irreversible). "
             "Note: Substack reloads the page when visibility != 'visible'."
         ),
     ),
@@ -422,6 +432,11 @@ def comments_ban_cmd(
         emit_error(
             f"Invalid --visibility {visibility!r}. "
             f"Must be one of: {sorted(VALID_VISIBILITIES)}",
+            pretty=pretty,
+        )
+    if expiry not in VALID_EXPIRIES:
+        emit_error(
+            f"Invalid --expiry {expiry!r}. Must be one of: {sorted(VALID_EXPIRIES)}",
             pretty=pretty,
         )
     if not is_write_enabled():
