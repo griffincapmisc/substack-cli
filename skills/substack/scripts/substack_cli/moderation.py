@@ -1,42 +1,10 @@
-"""Substack CLI — comment moderation: report, ban, and helper read commands.
+"""Substack CLI — comment moderation CLI layer (Typer commands only).
 
-New commands
-------------
-comments report <comment_id>         POST /api/v1/comment/{id}/report
-comments report-user <user_id>       POST https://substack.com/api/v1/users/{id}/profile/report
-comments ban <comment_id>            POST /api/v1/comment_ban/{id}
-comments bans <user_id>              GET  /api/v1/user/{id}/bans  (read-only)
-moderation report-categories         GET  https://substack.com/api/v1/reporting/flows
-moderation delete-reasons            GET  /api/v1/comment/moderation/delete_reasons
-
-All write commands are gated by is_write_enabled() AND default to
-dry-run mode unless --no-dry-run / --yes is passed.
-
-Endpoint notes (reverse-engineered from Substack web bundle):
-  • comment report:      POST /api/v1/comment/{comment_id}/report
-                         body: {publication_id, details, reportCategory,
-                                reportedToSubstack, report_context}
-  • profile report:      POST https://substack.com/api/v1/users/{user_id}/profile/report
-                         body: {details, reportCategory, surface:"profile",
-                                report_context}
-  • ban:                 POST /api/v1/comment_ban/{comment_id}
-                         body: {user_id, expiry, commentVisibility}
-    commentVisibility enum (confirmed from bundle module 5646, the ban
-    modal's "comment_visibility" <select>):
-        "visible"              — "Do not delete comments"
-        "delete_this_comment"  — "Delete this comment"
-        "delete_all_comments"  — "Also delete all comments" (irreversible)
-    expiry enum (confirmed from bundle module 92538, the ban modal's
-    "expiry" <select>; the UI posts the option value verbatim):
-        "1d" | "30d" | "90d" | "1y" | "1000y"   ("1000y" is labelled "Forever")
-        The server returns the ban with an absolute expiry datetime, which is
-        what the UI later compares with isAfter().
-  • report_context:  shape not found in bundle; accepted as optional JSON
-                     string; omit or pass null and the API ignores it.
+Core logic, enums, and body builders live in moderation_core.py.
+All write commands default to dry-run unless --no-dry-run / --yes is passed.
 """
 from __future__ import annotations
 
-import json
 from typing import Optional
 
 import typer
@@ -55,6 +23,20 @@ from substack_cli.client import (
     emit_error,
     output,
 )
+from substack_cli.moderation_core import (
+    VALID_CATEGORIES,
+    VALID_EXPIRIES,
+    VALID_VISIBILITIES,
+    ban_commenter,
+    build_ban_body,
+    build_profile_report_body,
+    build_report_body,
+    get_delete_reasons,
+    get_report_categories,
+    get_user_bans,
+    report_comment,
+    report_user_profile,
+)
 
 # ---------------------------------------------------------------------------
 # New top-level sub-app: moderation
@@ -66,29 +48,6 @@ moderation_app = typer.Typer(
 )
 app.add_typer(moderation_app, name="moderation")
 
-# ---------------------------------------------------------------------------
-# Validated enum values
-# ---------------------------------------------------------------------------
-
-# reportCategory values confirmed from bundle module 74588
-VALID_CATEGORIES = {
-    "spam",
-    "impersonation",
-    "hate",
-    "private_information",
-    "plagiarism",
-    "illegal_activity",
-    "pornography",
-    "other",
-}
-
-# commentVisibility values confirmed from bundle module 5646 (ban modal select)
-VALID_VISIBILITIES = {"visible", "delete_this_comment", "delete_all_comments"}
-
-# expiry values confirmed from bundle module 92538 (ban modal "Ban duration"
-# select). "1000y" is the UI's "Forever".
-VALID_EXPIRIES = {"1d", "30d", "90d", "1y", "1000y"}
-
 
 # ---------------------------------------------------------------------------
 # Helper: build client
@@ -98,16 +57,6 @@ def _make_client() -> SubstackClient:
     cookies = resolve_cookies()
     pub_url = resolve_publication_url()
     return SubstackClient(cookies=cookies, publication_url=pub_url)
-
-
-def _resolve_pub_id(client: SubstackClient) -> Optional[int]:
-    """Try to fetch the publication id from the /self profile endpoint.
-    Returns None if unavailable (non-fatal for report commands)."""
-    try:
-        profile = client.get("/api/v1/publication/self")
-        return profile.get("id")
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -123,108 +72,6 @@ def _dry_run_output(method: str, url: str, body: dict, pretty: bool) -> None:
         "body": body,
     }
     output(payload, pretty=pretty)
-
-
-# ---------------------------------------------------------------------------
-# Core logic functions (testable without CLI layer)
-# ---------------------------------------------------------------------------
-
-def report_comment(
-    client: SubstackClient,
-    comment_id: int,
-    category: str,
-    details: str,
-    reported_to_substack: bool,
-    publication_id: Optional[int],
-    report_context: Optional[str],
-) -> dict:
-    """Report a comment via POST /api/v1/comment/{comment_id}/report."""
-    if not is_write_enabled():
-        raise ValueError("Write operations require SUBSTACK_ENABLE_WRITE=true")
-    body: dict = {
-        "reportCategory": category,
-        "details": details,
-        "reportedToSubstack": reported_to_substack,
-    }
-    if publication_id is not None:
-        body["publication_id"] = publication_id
-    if report_context is not None:
-        try:
-            body["report_context"] = json.loads(report_context)
-        except json.JSONDecodeError:
-            body["report_context"] = report_context
-    return client.post(f"/api/v1/comment/{comment_id}/report", json_body=body)
-
-
-def report_user_profile(
-    client: SubstackClient,
-    user_id: int,
-    category: str,
-    details: str,
-    reported_to_substack: bool,
-    report_context: Optional[str],
-) -> dict:
-    """Report a user profile via POST https://substack.com/api/v1/users/{user_id}/profile/report."""
-    if not is_write_enabled():
-        raise ValueError("Write operations require SUBSTACK_ENABLE_WRITE=true")
-    body: dict = {
-        "reportCategory": category,
-        "details": details,
-        "reportedToSubstack": reported_to_substack,
-        "surface": "profile",
-    }
-    if report_context is not None:
-        try:
-            body["report_context"] = json.loads(report_context)
-        except json.JSONDecodeError:
-            body["report_context"] = report_context
-    return client.post(
-        f"/api/v1/users/{user_id}/profile/report",
-        host="A",
-        json_body=body,
-    )
-
-
-def ban_commenter(
-    client: SubstackClient,
-    comment_id: int,
-    user_id: int,
-    expiry: str,
-    comment_visibility: str,
-) -> dict:
-    """Ban a commenter via POST /api/v1/comment_ban/{comment_id}."""
-    if not is_write_enabled():
-        raise ValueError("Write operations require SUBSTACK_ENABLE_WRITE=true")
-    if comment_visibility not in VALID_VISIBILITIES:
-        raise ValueError(
-            f"Invalid commentVisibility {comment_visibility!r}. "
-            f"Must be one of: {sorted(VALID_VISIBILITIES)}"
-        )
-    if expiry not in VALID_EXPIRIES:
-        raise ValueError(
-            f"Invalid expiry {expiry!r}. Must be one of: {sorted(VALID_EXPIRIES)}"
-        )
-    body: dict = {
-        "user_id": user_id,
-        "expiry": expiry,
-        "commentVisibility": comment_visibility,
-    }
-    return client.post(f"/api/v1/comment_ban/{comment_id}", json_body=body)
-
-
-def get_user_bans(client: SubstackClient, user_id: int) -> dict:
-    """Read bans for a user: GET /api/v1/user/{user_id}/bans."""
-    return client.get(f"/api/v1/user/{user_id}/bans")
-
-
-def get_report_categories(client: SubstackClient) -> dict:
-    """GET https://substack.com/api/v1/reporting/flows — report category tree."""
-    return client.get("/api/v1/reporting/flows", host="A")
-
-
-def get_delete_reasons(client: SubstackClient) -> dict:
-    """GET /api/v1/comment/moderation/delete_reasons."""
-    return client.get("/api/v1/comment/moderation/delete_reasons")
 
 
 # ---------------------------------------------------------------------------
@@ -252,13 +99,14 @@ def comments_report_cmd(
         "--to-substack/--no-to-substack",
         help="Whether to also report to Substack trust & safety.",
     ),
-    report_context: Optional[str] = typer.Option(
+    publication_id: Optional[int] = typer.Option(
         None,
-        "--report-context",
-        help=(
-            "Optional JSON string for report_context field "
-            "(shape unknown; omit in most cases)."
-        ),
+        "--publication-id",
+        help="Numeric publication ID for the report body (no resolver — find via DevTools).",
+    ),
+    report_context: Optional[str] = typer.Option(
+        None, "--report-context",
+        help="Optional JSON string for report_context (shape unknown; omit in most cases).",
     ),
     no_dry_run: bool = typer.Option(
         False,
@@ -279,30 +127,22 @@ def comments_report_cmd(
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
 
     try:
-        client = _make_client()
-        pub_id = _resolve_pub_id(client)
+        body = build_report_body(
+            category, details, to_substack, publication_id, report_context
+        )
 
-        body: dict = {
-            "reportCategory": category,
-            "details": details,
-            "reportedToSubstack": to_substack,
-        }
-        if pub_id is not None:
-            body["publication_id"] = pub_id
-        if report_context is not None:
-            try:
-                body["report_context"] = json.loads(report_context)
-            except json.JSONDecodeError:
-                body["report_context"] = report_context
-
-        url = f"{client._publication_url}/api/v1/comment/{comment_id}/report"
+        # Build URL from publication URL without making any HTTP call.
+        pub_url = resolve_publication_url()
+        url = f"{pub_url}/api/v1/comment/{comment_id}/report"
 
         if not no_dry_run:
             _dry_run_output("POST", url, body, pretty=pretty)
             return
 
+        client = _make_client()
         result = report_comment(
-            client, comment_id, category, details, to_substack, pub_id, report_context
+            client, comment_id, category, details, to_substack, publication_id,
+            report_context,
         )
         output(result, pretty=pretty)
 
@@ -361,18 +201,7 @@ def comments_report_user_cmd(
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
 
     try:
-        body: dict = {
-            "reportCategory": category,
-            "details": details,
-            "reportedToSubstack": to_substack,
-            "surface": "profile",
-        }
-        if report_context is not None:
-            try:
-                body["report_context"] = json.loads(report_context)
-            except json.JSONDecodeError:
-                body["report_context"] = report_context
-
+        body = build_profile_report_body(category, details, to_substack, report_context)
         url = f"{SUBSTACK_COM}/api/v1/users/{user_id}/profile/report"
 
         if not no_dry_run:
@@ -443,19 +272,15 @@ def comments_ban_cmd(
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
 
     try:
-        client = _make_client()
-
-        body: dict = {
-            "user_id": user_id,
-            "expiry": expiry,
-            "commentVisibility": visibility,
-        }
-        url = f"{client._publication_url}/api/v1/comment_ban/{comment_id}"
+        body = build_ban_body(user_id, expiry, visibility)
+        pub_url = resolve_publication_url()
+        url = f"{pub_url}/api/v1/comment_ban/{comment_id}"
 
         if not no_dry_run:
             _dry_run_output("POST", url, body, pretty=pretty)
             return
 
+        client = _make_client()
         result = ban_commenter(client, comment_id, user_id, expiry, visibility)
         output(result, pretty=pretty)
 

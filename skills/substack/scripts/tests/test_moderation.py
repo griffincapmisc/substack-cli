@@ -7,7 +7,7 @@ import respx
 
 from substack_cli.app import comments_app
 from substack_cli.client import SubstackClient, SUBSTACK_COM
-from substack_cli.moderation import (
+from substack_cli.moderation_core import (
     ban_commenter,
     get_delete_reasons,
     get_report_categories,
@@ -17,6 +17,9 @@ from substack_cli.moderation import (
     VALID_CATEGORIES,
     VALID_EXPIRIES,
     VALID_VISIBILITIES,
+    build_report_body,
+    build_profile_report_body,
+    build_ban_body,
 )
 
 # ---------------------------------------------------------------------------
@@ -321,6 +324,63 @@ def test_comments_report_dry_run_prints_request(
     assert data["body"]["reportedToSubstack"] is True
 
 
+def test_comments_report_dry_run_zero_http_calls(
+    isolated_config, authed_env, write_enabled_env, cli_runner
+):
+    """Dry-run must issue ZERO HTTP requests — no network call at all."""
+    from substack_cli.moderation import moderation_app  # noqa
+
+    with respx.mock(assert_all_called=False) as router:
+        result = cli_runner.invoke(
+            comments_app,
+            ["report", "111", "--category", "spam"],
+        )
+    assert result.exit_code == 0, result.output
+    # No routes were registered, so any actual request would have raised.
+    assert len(router.calls) == 0
+
+
+def test_comments_report_dry_run_with_publication_id(
+    isolated_config, authed_env, write_enabled_env, cli_runner
+):
+    """--publication-id is echoed in the dry-run body."""
+    from substack_cli.moderation import moderation_app  # noqa
+
+    result = cli_runner.invoke(
+        comments_app,
+        ["report", "111", "--category", "spam", "--publication-id", "42"],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["dry_run"] is True
+    assert data["body"]["publication_id"] == 42
+
+
+@respx.mock
+def test_comments_report_live_sends_publication_id(
+    fake_cookies, fake_publication_url, isolated_config, authed_env,
+    write_enabled_env, cli_runner,
+):
+    """--publication-id is sent in the live POST body."""
+    route = respx.post(
+        f"{fake_publication_url}/api/v1/comment/111/report"
+    ).mock(return_value=httpx.Response(200, json={"ok": True}))
+
+    result = cli_runner.invoke(
+        comments_app,
+        [
+            "report", "111",
+            "--category", "spam",
+            "--publication-id", "99",
+            "--no-dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert route.called
+    body = json.loads(route.calls[0].request.content)
+    assert body["publication_id"] == 99
+
+
 def test_comments_report_user_dry_run_uses_substack_com(
     isolated_config, authed_env, write_enabled_env, cli_runner
 ):
@@ -445,9 +505,8 @@ def test_valid_expiries_match_bundle():
 
 def test_ban_commenter_rejects_iso_expiry(monkeypatch):
     """Substack's ban modal posts duration codes, not datetimes."""
-    import pytest
     from unittest.mock import MagicMock
-    from substack_cli import moderation as m
+    import substack_cli.moderation_core as m
     monkeypatch.setattr(m, "is_write_enabled", lambda: True)
     client = MagicMock()
     with pytest.raises(ValueError, match="Invalid expiry"):
@@ -464,3 +523,41 @@ def test_comments_ban_cli_rejects_bad_expiry(monkeypatch):
     )
     assert result.exit_code != 0
     assert "Invalid --expiry" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Body builder unit tests (pure functions, no HTTP)
+# ---------------------------------------------------------------------------
+
+
+def test_build_report_body_with_publication_id():
+    body = build_report_body("spam", "details", True, 42, None)
+    assert body["publication_id"] == 42
+    assert body["reportCategory"] == "spam"
+    assert "report_context" not in body
+
+
+def test_build_report_body_omits_publication_id_when_none():
+    body = build_report_body("hate", "", False, None, None)
+    assert "publication_id" not in body
+
+
+def test_build_report_body_parses_report_context_json():
+    body = build_report_body("spam", "", True, None, '{"k": 1}')
+    assert body["report_context"] == {"k": 1}
+
+
+def test_build_report_body_passes_bad_json_as_string():
+    body = build_report_body("spam", "", True, None, "not-json")
+    assert body["report_context"] == "not-json"
+
+
+def test_build_profile_report_body_has_surface():
+    body = build_profile_report_body("impersonation", "fake", True, None)
+    assert body["surface"] == "profile"
+    assert body["reportCategory"] == "impersonation"
+
+
+def test_build_ban_body_correct_keys():
+    body = build_ban_body(777, "1y", "visible")
+    assert body == {"user_id": 777, "expiry": "1y", "commentVisibility": "visible"}
