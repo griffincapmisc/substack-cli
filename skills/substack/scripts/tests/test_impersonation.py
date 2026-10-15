@@ -1,26 +1,58 @@
 """Unit tests for impersonation detection rules.
 
 Covers:
-  POSITIVE cases — must be flagged:
-    - WhatsApp phone number in display name
-    - Telegram handle in display name
-    - Unicode-styled 'Charlie Garcia' (mathematical bold)
-    - Cyrillic confusable in 'Charlie'
-    - Phone number in comment body
+  POSITIVE cases — must be flagged (name_reasons non-empty):
+    - 'Charlie Garcia' (non-real user_id) → charlie_garcia_name
+    - 'Charlie P. Garcia' → charlie_garcia_name
+    - 'charliepgarcia' handle-style → charlie_garcia_name
+    - Mathematical bold 𝐂𝐡𝐚𝐫𝐥𝐢𝐞 Garcia → charlie_confusable_name
+    - Cyrillic Ϲharlie → charlie_confusable_name
+    - Fullwidth Ｃｈａｒｌｉｅ → charlie_confusable_name
+    - Dotted C.h.a.r.l.i.e Garcia → charlie_garcia_name (punct stripped)
+    - 'Charlie WhatsApp +1 672 906 6441' → charlie_with_lure_name + contacts
+    - WhatsApp keyword in name → whatsapp_contact
+    - Telegram handle in name → telegram_contact
+    - Phone number in name → phone_number
+    - t.me/ link in name → telegram_contact
 
-  NEGATIVE cases — must NOT be flagged:
-    - Ordinary reader named Charles
-    - The real Charlie account (allowlisted by user_id)
-    - A subscriber whose name contains 'arch' but not 'charlie'
-    - A name that normalizes to exactly 'charlie' (no extra content)
+  NEGATIVE (name) — must NOT produce name_reasons:
+    - 'Charlie Smith' (plain ASCII, no lure, no Garcia) → no match
+    - 'Charlie Brown' → no match
+    - 'Charlotte Garcia' → no match (normalize: charlottegarcia, no charliegarcia)
+    - 'Charles Garcia' → no match (normalize: charlesgarcia, not charliegarcia)
+    - 'Charlie' alone → no match
+    - Ordinary reader 'Sarah Johnson' → no match
+    - 'Marchello' (contains 'arch' but not 'charlie') → no match
+    - Real Charlie (user_id 27965159) 'Charlie Garcia' → allowlisted, no name_reason
+
+  BODY — body-only contact lures → body_reasons only (uncertain, never candidate):
+    - 'WhatsApp me at +1 672 906 6441' → body_contact_lure
+    - 'Telegram me (@CharlieGarcia1)' → body_contact_lure
+    - 'wa.me/16729066441' → body_contact_lure
+    - t.me/ link → body_contact_lure
+
+  BODY — innocent mentions must NOT match:
+    - "I got a WhatsApp from a fake Charlie" → no body lure
+    - "Sorry you have to deal with these Telegram scammers" → no body lure
+    - "they impersonate via WhatsApp" → no body lure
+
+  RECORD_CANDIDATE routing:
+    - name_reasons only → candidate
+    - body_reasons only → uncertain (body_only_review), never candidate, cap not consumed
+    - both → candidate (name-driven)
+    - daily cap shunts name-triggered to uncertain/cap_exceeded
+    - dedupe skips already-acted user
 """
 import pytest
+import unittest.mock as mock
 
 from substack_cli.impersonation import (
     ALLOWLISTED_USER_IDS,
     REAL_CHARLIE_USER_ID,
     _detect,
     _normalize_for_detection,
+    _has_non_ascii_confusable,
+    _body_has_contact_lure,
     _walk_comments,
     _record_candidate,
     _load_seen,
@@ -41,7 +73,6 @@ class TestNormalizeForDetection:
         assert _normalize_for_detection(bold) == "charlie"
 
     def test_cyrillic_c(self):
-        # Cyrillic С + harlie
         assert _normalize_for_detection("\u0421harlie") == "charlie"
 
     def test_dots_between_letters(self):
@@ -55,141 +86,267 @@ class TestNormalizeForDetection:
         assert _normalize_for_detection("\u010Aharlie") == "charlie"
 
     def test_fullwidth(self):
-        # Fullwidth Ｃｈａｒｌｉｅ
         fw = "\uFF23\uFF48\uFF41\uFF52\uFF4C\uFF49\uFF45"
         assert _normalize_for_detection(fw) == "charlie"
 
+    def test_charlie_garcia_strips_space(self):
+        assert _normalize_for_detection("Charlie Garcia") == "charliegarcia"
+
+    def test_charles_garcia_not_charliegarcia(self):
+        assert _normalize_for_detection("Charles Garcia") == "charlesgarcia"
+
+    def test_charlotte_garcia_not_charliegarcia(self):
+        assert _normalize_for_detection("Charlotte Garcia") == "charlottegarcia"
+
 
 # ---------------------------------------------------------------------------
-# _detect — POSITIVE cases
+# _has_non_ascii_confusable
 # ---------------------------------------------------------------------------
 
-class TestDetectPositive:
-    def test_whatsapp_phone_in_name(self):
-        """'Charlie WhatsApp +1 672 906 6441' → whatsapp_contact + phone_number"""
-        reasons = _detect("Charlie WhatsApp +1 672 906 6441", "")
-        assert "whatsapp_contact" in reasons
-        assert "phone_number" in reasons
+class TestHasNonAsciiConfusable:
+    def test_plain_ascii_false(self):
+        assert not _has_non_ascii_confusable("Charlie Garcia")
 
-    def test_telegram_handle_in_name(self):
-        """'Telegram me (@CharlieGarcia1)' → telegram_contact"""
-        reasons = _detect("Telegram me (@CharlieGarcia1)", "")
-        assert "telegram_contact" in reasons
+    def test_cyrillic_c_true(self):
+        assert _has_non_ascii_confusable("\u0421harlie")
 
-    def test_telegram_in_name(self):
-        """Telegram handle embedded directly in display name."""
-        reasons = _detect("Charlie Garcia @CharlieOfficial_tg", "")
-        assert "telegram_contact" in reasons
+    def test_math_bold_true(self):
+        bold = "\U0001D402\U0001D421\U0001D41A\U0001D42B\U0001D425\U0001D422\U0001D41E"
+        assert _has_non_ascii_confusable(bold)
 
-    def test_whatsapp_in_name(self):
-        """WhatsApp keyword embedded directly in display name."""
-        reasons = _detect("Charlie WhatsApp Investor", "")
-        assert "whatsapp_contact" in reasons
+    def test_fullwidth_true(self):
+        fw = "\uFF23\uFF48\uFF41\uFF52\uFF4C\uFF49\uFF45"
+        assert _has_non_ascii_confusable(fw)
 
-    def test_body_alone_does_not_trigger(self):
-        """A reader mentioning WhatsApp/Telegram in the body (as victim/reporter)
-        must NOT be flagged — body is intentionally not scanned."""
-        reasons = _detect("Ellen", "I've gotten countless WhatsApp messages from fake Charlie accounts")
-        assert reasons == []
 
-    def test_body_telegram_not_trigger(self):
-        reasons = _detect("Tom H", "Sorry you have to deal with these Telegram scammers")
-        assert reasons == []
+# ---------------------------------------------------------------------------
+# _body_has_contact_lure
+# ---------------------------------------------------------------------------
 
-    def test_unicode_bold_charlie_name(self):
-        """Mathematical bold 𝐂𝐡𝐚𝐫𝐥𝐢𝐞 Garcia → disguised_charlie_name"""
+class TestBodyHasContactLure:
+    # Positive — direct invitations
+    def test_whatsapp_me_phone(self):
+        assert _body_has_contact_lure("WhatsApp me at +1 672 906 6441")
+
+    def test_telegram_me_handle(self):
+        assert _body_has_contact_lure("Telegram me (@CharlieGarcia1)")
+
+    def test_message_me_on_whatsapp(self):
+        assert _body_has_contact_lure("message me on WhatsApp for details")
+
+    def test_wame_link(self):
+        assert _body_has_contact_lure("Join via wa.me/16729066441")
+
+    def test_tme_link(self):
+        assert _body_has_contact_lure("reach out at t.me/charliegarcia_official")
+
+    def test_contact_me_telegram(self):
+        assert _body_has_contact_lure("contact me on Telegram @CharlieG123")
+
+    def test_whatsapp_with_phone(self):
+        assert _body_has_contact_lure("WhatsApp +16729066441 for investment tips")
+
+    # Negative — innocent mentions
+    def test_victim_reporting_whatsapp(self):
+        assert not _body_has_contact_lure(
+            "I got a WhatsApp from a fake Charlie account yesterday"
+        )
+
+    def test_discussing_telegram_scam(self):
+        assert not _body_has_contact_lure(
+            "Sorry you have to deal with these Telegram scammers"
+        )
+
+    def test_warning_about_whatsapp(self):
+        assert not _body_has_contact_lure(
+            "They impersonate Charlie via WhatsApp — watch out everyone"
+        )
+
+    def test_no_platform_keyword(self):
+        assert not _body_has_contact_lure("Call me at +16729066441")
+
+    def test_empty_body(self):
+        assert not _body_has_contact_lure("")
+
+
+# ---------------------------------------------------------------------------
+# _detect — POSITIVE name cases (name_reasons non-empty)
+# ---------------------------------------------------------------------------
+
+class TestDetectPositiveName:
+    def test_charlie_garcia_non_real(self):
+        """'Charlie Garcia' with non-real user_id → charlie_garcia_name"""
+        name_r, body_r = _detect("Charlie Garcia", "", user_id=99999)
+        assert "charlie_garcia_name" in name_r
+
+    def test_charlie_p_garcia(self):
+        """'Charlie P. Garcia' → charlie_garcia_name (charliepgarcia after norm)"""
+        name_r, _ = _detect("Charlie P. Garcia", "", user_id=99999)
+        assert "charlie_garcia_name" in name_r
+
+    def test_charliepgarcia_handle_style(self):
+        name_r, _ = _detect("charliepgarcia", "", user_id=99999)
+        assert "charlie_garcia_name" in name_r
+
+    def test_dotted_charlie_garcia(self):
+        """C.h.a.r.l.i.e Garcia → charlie_garcia_name"""
+        name_r, _ = _detect("C.h.a.r.l.i.e Garcia", "", user_id=99999)
+        assert "charlie_garcia_name" in name_r
+
+    def test_unicode_bold_charlie_garcia(self):
+        """Math-bold 𝐂𝐡𝐚𝐫𝐥𝐢𝐞 Garcia → both confusable + garcia rules"""
         bold_charlie = (
             "\U0001D402\U0001D421\U0001D41A\U0001D42B\U0001D425\U0001D422\U0001D41E"
             " Garcia"
         )
-        reasons = _detect(bold_charlie, "")
-        assert "disguised_charlie_name" in reasons
+        name_r, _ = _detect(bold_charlie, "", user_id=99999)
+        assert "charlie_confusable_name" in name_r
 
-    def test_cyrillic_charlie_name(self):
-        """\u0421harlie Garcia (Cyrillic С) → disguised_charlie_name"""
-        reasons = _detect("\u0421harlie Garcia", "")
-        assert "disguised_charlie_name" in reasons
+    def test_cyrillic_charlie_confusable(self):
+        """\u0421harlie (Cyrillic С) → charlie_confusable_name"""
+        name_r, _ = _detect("\u0421harlie Garcia", "", user_id=99999)
+        assert "charlie_confusable_name" in name_r
+
+    def test_fullwidth_charlie_confusable(self):
+        fw = "\uFF23\uFF48\uFF41\uFF52\uFF4C\uFF49\uFF45 Garcia"
+        name_r, _ = _detect(fw, "", user_id=99999)
+        assert "charlie_confusable_name" in name_r
+
+    def test_charlie_whatsapp_phone_in_name(self):
+        """'Charlie WhatsApp +1 672 906 6441' → charlie_with_lure_name + contacts"""
+        name_r, _ = _detect("Charlie WhatsApp +1 672 906 6441", "", user_id=99999)
+        assert "whatsapp_contact" in name_r
+        assert "phone_number" in name_r
+        assert "charlie_with_lure_name" in name_r
+
+    def test_whatsapp_keyword_in_name(self):
+        name_r, _ = _detect("Charlie WhatsApp Investor", "", user_id=99999)
+        assert "whatsapp_contact" in name_r
+
+    def test_telegram_handle_in_name(self):
+        name_r, _ = _detect("Charlie Garcia @CharlieOfficial_tg", "", user_id=99999)
+        assert "telegram_contact" in name_r
 
     def test_phone_in_name(self):
-        """Phone number embedded in display name triggers phone_number."""
-        reasons = _detect("Charlie +16729066441", "")
-        assert "phone_number" in reasons
-
-    def test_phone_only_in_body_no_trigger(self):
-        """Phone in body alone must NOT trigger — body is not scanned."""
-        reasons = _detect("Random Name", "call me at +16729066441 for details")
-        assert "phone_number" not in reasons
-
-    def test_dotted_charlie_garcia(self):
-        """C.h.a.r.l.i.e Garcia → disguised_charlie_name"""
-        reasons = _detect("C.h.a.r.l.i.e Garcia", "")
-        assert "disguised_charlie_name" in reasons
+        name_r, _ = _detect("Charlie +16729066441", "", user_id=99999)
+        assert "phone_number" in name_r
 
     def test_tme_link_in_name(self):
-        """t.me/ link embedded in display name triggers telegram_contact."""
-        reasons = _detect("Some Guy t.me/charliegarcia_official", "")
-        assert "telegram_contact" in reasons
-
-    def test_tme_link_in_body_no_trigger(self):
-        """t.me/ in body alone must NOT trigger — body is not scanned."""
-        reasons = _detect("Some Guy", "Join at t.me/charliegarcia_official")
-        assert "telegram_contact" not in reasons
+        name_r, _ = _detect("Some Guy t.me/charliegarcia_official", "", user_id=99999)
+        assert "telegram_contact" in name_r
 
     def test_whatsapp_api_url_in_name(self):
-        """api.whatsapp.com URL in display name triggers whatsapp_contact."""
-        reasons = _detect("Some Guy api.whatsapp.com/send", "")
-        assert "whatsapp_contact" in reasons
-
-    def test_whatsapp_api_url_in_body_no_trigger(self):
-        """api.whatsapp.com in body alone must NOT trigger."""
-        reasons = _detect("Some Guy", "api.whatsapp.com/send?phone=16729066441")
-        assert "whatsapp_contact" not in reasons
+        name_r, _ = _detect("Some Guy api.whatsapp.com/send", "", user_id=99999)
+        assert "whatsapp_contact" in name_r
 
 
 # ---------------------------------------------------------------------------
-# _detect — NEGATIVE cases
+# _detect — NEGATIVE name cases (name_reasons must be empty)
 # ---------------------------------------------------------------------------
 
-class TestDetectNegative:
-    def test_ordinary_charles(self):
-        """Charles Smith — a real reader, no contact lure."""
-        reasons = _detect("Charles Smith", "Great article, thanks!")
-        assert reasons == []
+class TestDetectNegativeName:
+    def test_charlie_smith_no_match(self):
+        """'Charlie Smith' — plain ASCII, no lure, no Garcia → no name match"""
+        name_r, _ = _detect("Charlie Smith", "", user_id=99999)
+        assert "charlie_garcia_name" not in name_r
+        assert "charlie_confusable_name" not in name_r
+        assert "charlie_with_lure_name" not in name_r
 
-    def test_ordinary_reader_no_charlie(self):
-        reasons = _detect("Sarah Johnson", "Looking forward to the next issue.")
-        assert reasons == []
+    def test_charlie_brown_no_match(self):
+        name_r, _ = _detect("Charlie Brown", "", user_id=99999)
+        assert not any(r in name_r for r in [
+            "charlie_garcia_name", "charlie_confusable_name", "charlie_with_lure_name"
+        ])
+
+    def test_charlotte_garcia_no_match(self):
+        """'Charlotte Garcia' normalizes to 'charlottegarcia' — not charliegarcia"""
+        name_r, _ = _detect("Charlotte Garcia", "", user_id=99999)
+        assert "charlie_garcia_name" not in name_r
+        assert "charlie_confusable_name" not in name_r
+
+    def test_charles_garcia_no_match(self):
+        """'Charles Garcia' normalizes to 'charlesgarcia' — not charliegarcia.
+        Charles Garcia alone is NOT auto-reported; at most flagged for human
+        review if a body lure appears, but the name alone is not a match."""
+        name_r, _ = _detect("Charles Garcia", "", user_id=99999)
+        assert "charlie_garcia_name" not in name_r
+        assert "charlie_confusable_name" not in name_r
+
+    def test_charlie_alone_no_match(self):
+        """Plain 'Charlie' alone — innocent first name, no match."""
+        name_r, _ = _detect("Charlie", "", user_id=99999)
+        assert not name_r
+
+    def test_ordinary_reader_no_match(self):
+        name_r, body_r = _detect("Sarah Johnson", "Looking forward to the next issue.", user_id=99999)
+        assert name_r == []
+        assert body_r == []
 
     def test_arch_in_name_not_charlie(self):
-        """'Marchello' contains 'arch' but normalized is 'marchello', not 'charlie'."""
-        reasons = _detect("Marchello", "")
-        assert reasons == []
+        name_r, _ = _detect("Marchello", "", user_id=99999)
+        assert name_r == []
 
-    def test_exactly_charlie_normalized(self):
-        """A name that normalizes to EXACTLY 'charlie' with nothing else.
+    def test_real_charlie_user_id_no_garcia_rule(self):
+        """Real Charlie (user_id 27965159) with name 'Charlie Garcia' → no charlie_garcia_name
+        (Rule A explicitly skips when user_id == REAL_CHARLIE_USER_ID)."""
+        name_r, _ = _detect("Charlie Garcia", "", user_id=REAL_CHARLIE_USER_ID)
+        assert "charlie_garcia_name" not in name_r
 
-        The rule requires charlie to appear plus something more in the normalized
-        form (len > len('charlie')), so a standalone 'Charlie' is NOT flagged —
-        it would catch innocent readers named Charlie.
-        """
-        # Plain 'Charlie' alone: normalized = 'charlie', which equals _CHARLIE_NORM
-        # so the condition `_CHARLIE_NORM in norm_name and _CHARLIE_NORM != norm_name`
-        # is False — correctly NOT flagged.
-        reasons = _detect("Charlie", "")
-        assert "disguised_charlie_name" not in reasons
+    def test_body_alone_no_name_reasons(self):
+        """WhatsApp in body with no name lure → name_reasons empty"""
+        name_r, _ = _detect("Ellen", "I've gotten countless WhatsApp messages from fake Charlie accounts")
+        assert name_r == []
 
-    def test_real_charlie_allowlist(self):
-        """The real Charlie account is protected by allowlist (user_id check),
-        not the detection function itself — _detect doesn't see user_id.
-        Confirm his display name 'Charlie Garcia' would fire the rule..."""
-        reasons = _detect("Charlie Garcia", "")
-        # 'Charlie Garcia' normalizes to 'charliegarcia' which contains 'charlie'
-        # and is longer — so _detect DOES flag it. This is expected and correct:
-        # the allowlist (by user_id) is what prevents action, not _detect.
-        assert "disguised_charlie_name" in reasons
+    def test_phone_only_in_body_no_name_reason(self):
+        name_r, _ = _detect("Random Name", "call me at +16729066441 for details")
+        assert "phone_number" not in name_r
 
+    def test_tme_link_in_body_no_name_reason(self):
+        name_r, _ = _detect("Some Guy", "Join at t.me/charliegarcia_official")
+        assert "telegram_contact" not in name_r
+
+    def test_whatsapp_api_url_in_body_no_name_reason(self):
+        name_r, _ = _detect("Some Guy", "api.whatsapp.com/send?phone=16729066441")
+        assert "whatsapp_contact" not in name_r
+
+
+# ---------------------------------------------------------------------------
+# _detect — BODY positive cases (body_reasons non-empty, name_reasons empty)
+# ---------------------------------------------------------------------------
+
+class TestDetectBodyPositive:
+    def test_whatsapp_me_body(self):
+        """'WhatsApp me at +1 672 906 6441' in body → body_contact_lure"""
+        name_r, body_r = _detect("Ellen", "WhatsApp me at +1 672 906 6441")
+        assert name_r == []
+        assert "body_contact_lure" in body_r
+
+    def test_telegram_me_handle_body(self):
+        name_r, body_r = _detect("Tom H", "Telegram me (@CharlieGarcia1)")
+        assert name_r == []
+        assert "body_contact_lure" in body_r
+
+    def test_wame_link_body(self):
+        name_r, body_r = _detect("User", "wa.me/16729066441 for investment tips")
+        assert name_r == []
+        assert "body_contact_lure" in body_r
+
+    def test_innocent_victim_report_no_body_lure(self):
+        """Victim reporting the scam mentions WhatsApp — NOT a lure"""
+        _, body_r = _detect("Ellen", "I've gotten countless WhatsApp messages from fake Charlie accounts")
+        assert "body_contact_lure" not in body_r
+
+    def test_scam_discussion_no_body_lure(self):
+        _, body_r = _detect("Tom H", "Sorry you have to deal with these Telegram scammers")
+        assert "body_contact_lure" not in body_r
+
+
+# ---------------------------------------------------------------------------
+# Allowlist
+# ---------------------------------------------------------------------------
+
+class TestAllowlist:
     def test_allowlist_contains_real_charlie(self):
-        """Confirm REAL_CHARLIE_USER_ID is in ALLOWLISTED_USER_IDS."""
         assert REAL_CHARLIE_USER_ID in ALLOWLISTED_USER_IDS
         assert REAL_CHARLIE_USER_ID == 27965159
 
@@ -218,53 +375,128 @@ class TestWalkComments:
 
 
 # ---------------------------------------------------------------------------
-# _record_candidate — daily cap and dedupe
+# _record_candidate — routing, daily cap, dedupe
 # ---------------------------------------------------------------------------
 
 class TestRecordCandidate:
     def _make_state(self):
         return {"acted_user_ids": [], "daily_counts": {}}
 
-    def test_records_candidate(self):
+    def test_name_reasons_go_to_candidates(self):
         candidates, uncertain = [], []
         state = self._make_state()
         acted = set()
         _record_candidate(
             candidates, uncertain, acted, state,
-            user_id=999, name="Test User", reasons=["whatsapp_contact"],
+            user_id=999, name="Test User",
+            name_reasons=["whatsapp_contact"], body_reasons=[],
             surface="comment", ref_id=1, post_id=1,
             today_count=0, daily_cap=20, dry_run=True,
         )
         assert len(candidates) == 1
-        assert candidates[0]["user_id"] == 999
         assert candidates[0]["status"] == "would_report"
         assert "dry_run_call" in candidates[0]
+        assert uncertain == []
+
+    def test_body_only_goes_to_uncertain_not_candidate(self):
+        """body_reasons only → uncertain, status body_only_review, never candidate"""
+        candidates, uncertain = [], []
+        state = self._make_state()
+        acted = set()
+        _record_candidate(
+            candidates, uncertain, acted, state,
+            user_id=777, name="Ellen",
+            name_reasons=[], body_reasons=["body_contact_lure"],
+            surface="comment", ref_id=2, post_id=2,
+            today_count=0, daily_cap=20, dry_run=True,
+        )
+        assert candidates == []
+        assert len(uncertain) == 1
+        assert uncertain[0]["status"] == "body_only_review"
+        assert "dry_run_call" not in uncertain[0]
+
+    def test_body_only_does_not_consume_cap(self):
+        """body_only match must NOT increment the daily count"""
+        candidates, uncertain = [], []
+        state = self._make_state()
+        acted = set()
+        # fill cap with a real name match first
+        _record_candidate(
+            candidates, uncertain, acted, state,
+            user_id=111, name="Charlie Garcia",
+            name_reasons=["charlie_garcia_name"], body_reasons=[],
+            surface="comment", ref_id=10, post_id=10,
+            today_count=0, daily_cap=1, dry_run=True,
+        )
+        assert len(candidates) == 1
+        # now a body-only should still go to uncertain, not cap_exceeded
+        _record_candidate(
+            candidates, uncertain, acted, state,
+            user_id=222, name="Ellen",
+            name_reasons=[], body_reasons=["body_contact_lure"],
+            surface="comment", ref_id=11, post_id=10,
+            today_count=1, daily_cap=1, dry_run=True,
+        )
+        assert len(candidates) == 1  # no new candidate
+        assert uncertain[0]["status"] == "body_only_review"  # not cap_exceeded
+
+    def test_name_and_body_goes_to_candidates(self):
+        """Both name + body reasons → candidate (name-driven)"""
+        candidates, uncertain = [], []
+        state = self._make_state()
+        acted = set()
+        _record_candidate(
+            candidates, uncertain, acted, state,
+            user_id=333, name="Charlie Garcia",
+            name_reasons=["charlie_garcia_name"], body_reasons=["body_contact_lure"],
+            surface="comment", ref_id=3, post_id=3,
+            today_count=0, daily_cap=20, dry_run=True,
+        )
+        assert len(candidates) == 1
+        assert candidates[0]["status"] == "would_report"
+        assert "body_contact_lure" in candidates[0]["body_reasons"]
 
     def test_dedupe_skips_acted(self):
         candidates, uncertain = [], []
         state = self._make_state()
-        acted = {999}  # already acted on this user
+        acted = {999}
         _record_candidate(
             candidates, uncertain, acted, state,
-            user_id=999, name="Test User", reasons=["whatsapp_contact"],
+            user_id=999, name="Test User",
+            name_reasons=["whatsapp_contact"], body_reasons=[],
             surface="comment", ref_id=1, post_id=1,
             today_count=0, daily_cap=20, dry_run=True,
         )
         assert candidates == []
         assert uncertain == []
 
-    def test_daily_cap_shunts_to_uncertain(self):
+    def test_daily_cap_shunts_name_to_uncertain(self):
         candidates, uncertain = [], []
         state = {"acted_user_ids": [], "daily_counts": {"2026-10-15": 20}}
         acted = set()
-        import unittest.mock as mock
         with mock.patch("substack_cli.impersonation._today", return_value="2026-10-15"):
             _record_candidate(
                 candidates, uncertain, acted, state,
-                user_id=888, name="Cap Test", reasons=["phone_number"],
+                user_id=888, name="Cap Test",
+                name_reasons=["phone_number"], body_reasons=[],
                 surface="comment", ref_id=2, post_id=2,
                 today_count=20, daily_cap=20, dry_run=True,
             )
         assert candidates == []
         assert len(uncertain) == 1
         assert uncertain[0]["status"] == "cap_exceeded"
+        assert "dry_run_call" not in uncertain[0]
+
+    def test_no_reasons_is_noop(self):
+        candidates, uncertain = [], []
+        state = self._make_state()
+        acted = set()
+        _record_candidate(
+            candidates, uncertain, acted, state,
+            user_id=555, name="Nobody",
+            name_reasons=[], body_reasons=[],
+            surface="comment", ref_id=5, post_id=5,
+            today_count=0, daily_cap=20, dry_run=True,
+        )
+        assert candidates == []
+        assert uncertain == []

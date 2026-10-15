@@ -27,6 +27,8 @@ Daily cap
 ---------
   Default 20 would-report candidates per calendar day (--daily-cap to override).
   Candidates beyond the cap are logged as "uncertain" (cap_exceeded).
+  Body-only matches always go to uncertain regardless of the cap, and are never
+  auto-reported.
 """
 from __future__ import annotations
 
@@ -129,6 +131,29 @@ def _normalize_for_detection(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", mapped.lower())
 
 
+def _has_non_ascii_confusable(text: str) -> bool:
+    """Return True if *text* contains any non-ASCII character that our
+    confusables map (or NFKD) converts to an ASCII letter.
+
+    Used to distinguish 'Ϲharlie Garcia' (confusable C → disguise signal)
+    from plain ASCII 'Charlie Garcia' (innocent reader).
+    """
+    for ch in text:
+        if ord(ch) <= 127:
+            continue
+        # Check manual confusables map
+        if ch in _CONFUSABLES:
+            return True
+        # Check whether NFKD decomposition yields any ASCII base letter
+        nfkd_ch = unicodedata.normalize("NFKD", ch)
+        base = "".join(
+            c for c in nfkd_ch if unicodedata.category(c) != "Mn"
+        )
+        if base and all(ord(c) <= 127 for c in base) and base.isalpha():
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Detection rules
 # ---------------------------------------------------------------------------
@@ -147,46 +172,149 @@ _PHONE_RE = re.compile(
     r"(\+?\d[\d\s\-\.\(\)]{6,}\d)",
 )
 
-# 'charlie' after normalization — matched as a substring of the normalized name
+# 'charlie' and 'charliegarcia' after normalization
 _CHARLIE_NORM = "charlie"
+_CHARLIEGARCIA_NORM = "charliegarcia"
+_CHARLIEPGARCIA_NORM = "charliepgarcia"
+
+# Surnames that, combined with 'charlie', target Charlie Garcia specifically.
+# Normalization strips spaces/punctuation so "p garcia", "garcia" both match.
+_GARCIA_VARIANTS: frozenset[str] = frozenset({
+    "charliegarcia",
+    "charliepgarcia",
+})
+
+# Body scanning: only flag bodies that contain a *direct contact invitation*
+# — an imperative verb near whatsapp/telegram, or a bare link/phone together
+# with whatsapp/telegram.  Readers reporting or discussing the scam say things
+# like "I got a WhatsApp from fake Charlie" — those must NOT match.
+
+# Imperative contact verbs: "WhatsApp me", "message me on Telegram", etc.
+_BODY_INVITE_VERB_RE = re.compile(
+    r"\b(?:whatsapp|message|text|contact|dm|reach|ping|chat)\s+me\b"
+    r"|"
+    r"\b(?:reach\s+out|get\s+in\s+touch)\b",
+    re.IGNORECASE,
+)
+
+# wa.me / t.me links  (direct invite links)
+_BODY_INVITE_LINK_RE = re.compile(
+    r"(?:wa\.me|t\.me)/\S+",
+    re.IGNORECASE,
+)
+
+# Phone number in body (same pattern as name)
+_BODY_PHONE_RE = _PHONE_RE
+
+# @handle in body (Telegram-style, ≥4 chars)
+_BODY_HANDLE_RE = re.compile(r"@[A-Za-z0-9_]{4,}")
 
 
-def _detect(name: str, body: str) -> list[str]:
-    """Return list of match reason strings (empty = no match).
+def _body_has_contact_lure(body: str) -> bool:
+    """Return True only when the body carries a *direct contact invitation*.
 
-    Detection is intentionally **name-only** for keyword/phone rules.
-    Scanning the comment body produces overwhelming false positives: legitimate
-    readers mention WhatsApp/Telegram/phone numbers when *reporting* or
-    *discussing* impersonation scams. Only the display name is a reliable
-    signal — scammers embed their contact lure there, honest readers don't.
+    A direct contact invitation is one of:
+      (a) An imperative contact verb ("WhatsApp me", "message me", etc.)
+          near whatsapp or telegram keyword.
+      (b) A wa.me or t.me invite link together with whatsapp/telegram keyword.
+      (c) A phone number or @handle together with whatsapp/telegram keyword.
 
-    Rules applied to display name only:
-      - WhatsApp keyword (name contains "whatsapp", "wa.me", etc.)
-      - Telegram keyword or @handle (name contains "telegram", "t.me/", "@…")
-      - Phone number pattern in name (+1 672 906 6441, etc.)
-      - Disguised 'charlie' after Unicode confusables normalization
-
-    `body` parameter is accepted for API compatibility but intentionally
-    unused in the current ruleset.
+    A reader saying "I got a WhatsApp from a fake Charlie" does NOT match
+    because there is no imperative verb, invite link, or bare phone/handle
+    paired with the platform keyword.
     """
-    reasons: list[str] = []
+    has_whatsapp = bool(_WHATSAPP_RE.search(body))
+    has_telegram = bool(_TELEGRAM_RE.search(body))
+    if not (has_whatsapp or has_telegram):
+        return False
 
-    # All keyword/phone rules apply to the display name only
+    # Condition (a): imperative verb present
+    if _BODY_INVITE_VERB_RE.search(body):
+        return True
+
+    # Condition (b): invite link present
+    if _BODY_INVITE_LINK_RE.search(body):
+        return True
+
+    # Condition (c): phone number or @handle present alongside platform keyword
+    if _BODY_PHONE_RE.search(body) or _BODY_HANDLE_RE.search(body):
+        return True
+
+    return False
+
+
+def _detect(name: str, body: str, *, user_id: Optional[int] = None) -> tuple[list[str], list[str]]:
+    """Return (name_reasons, body_reasons).
+
+    name_reasons — triggers from the display name; actionable (candidates).
+    body_reasons — triggers from the comment body; uncertain bucket only,
+                   never auto-reported.
+
+    Bug 1 fix — disguised_charlie_name rules (replaces the old substring-only
+    check that matched any 'Charlie <Surname>'):
+
+      Rule A — charlie_garcia_name:
+        Normalized name contains 'charliegarcia' or 'charliepgarcia' AND
+        user_id is not the real Charlie (27965159).  Catches impersonators
+        who write "Charlie Garcia", "Charlie P. Garcia", "charliepgarcia", etc.
+
+      Rule B — charlie_confusable_name:
+        The raw name contains at least one non-ASCII confusable letter AND
+        the normalized form contains 'charlie'.  A disguise signal regardless
+        of surname: scammers use 𝐂𝐡𝐚𝐫𝐥𝐢𝐞, Ϲharlie, ＣＨＡＲＬＩＥ, etc.
+
+      Rule C — charlie_with_lure_name:
+        'charlie' in normalized name AND a contact lure (whatsapp/telegram/
+        phone/@handle) also appears in the display name.  Catches "Charlie
+        WhatsApp +1 672 906 6441" even without a Garcia surname.
+
+    A plain ASCII 'Charlie <OtherSurname>' with no lure does NOT match any
+    rule and is never flagged (e.g. 'Charlie Smith', 'Charlie Brown').
+
+    Note on 'Charles Garcia' / 'Charlotte Garcia': normalized forms are
+    'charlesgarcia' / 'charlottegarcia' — neither contains 'charliegarcia',
+    and both are plain ASCII with no lure, so they do NOT match.  'Charles
+    Garcia' is at most uncertain; flagging it would be a false positive.
+
+    Bug 2 fix — body scanning:
+      Body matches go to body_reasons (uncertain bucket, never auto-reported).
+      Only direct contact invitations match (see _body_has_contact_lure).
+    """
+    name_reasons: list[str] = []
+    body_reasons: list[str] = []
+
+    # ---- Name rules (contact lures) ----
     if _WHATSAPP_RE.search(name):
-        reasons.append("whatsapp_contact")
+        name_reasons.append("whatsapp_contact")
     if _TELEGRAM_RE.search(name):
-        reasons.append("telegram_contact")
+        name_reasons.append("telegram_contact")
     if _PHONE_RE.search(name):
-        reasons.append("phone_number")
+        name_reasons.append("phone_number")
 
-    # Charlie name check: display name only
+    # ---- Name rules (disguised Charlie) ----
     norm_name = _normalize_for_detection(name)
-    if _CHARLIE_NORM in norm_name and _CHARLIE_NORM != norm_name:
-        # Require charlie to appear as a substring with additional chars —
-        # avoids flagging innocent readers whose only name is "Charlie".
-        reasons.append("disguised_charlie_name")
 
-    return reasons
+    # Rule A: charlie garcia / charliepgarcia exact target
+    if any(variant in norm_name for variant in _GARCIA_VARIANTS):
+        is_real = (user_id is not None and int(user_id) == REAL_CHARLIE_USER_ID)
+        if not is_real:
+            name_reasons.append("charlie_garcia_name")
+
+    # Rule B: confusable letters that normalize to 'charlie' (disguise signal)
+    if _CHARLIE_NORM in norm_name and _has_non_ascii_confusable(name):
+        name_reasons.append("charlie_confusable_name")
+
+    # Rule C: 'charlie' in name AND contact lure also in name
+    if _CHARLIE_NORM in norm_name and (
+        _WHATSAPP_RE.search(name) or _TELEGRAM_RE.search(name) or _PHONE_RE.search(name)
+    ):
+        name_reasons.append("charlie_with_lure_name")
+
+    # ---- Body rule (uncertain bucket only) ----
+    if _body_has_contact_lure(body):
+        body_reasons.append("body_contact_lure")
+
+    return name_reasons, body_reasons
 
 
 # ---------------------------------------------------------------------------
@@ -352,13 +480,11 @@ def run_scan(
             if int(user_id) in ALLOWLISTED_USER_IDS:
                 continue
 
-            reasons = _detect(name, body)
-            if not reasons:
-                continue
-
+            name_reasons, body_reasons = _detect(name, body, user_id=int(user_id))
             _record_candidate(
                 candidates, uncertain, acted_ids, state,
-                user_id=int(user_id), name=name, reasons=reasons,
+                user_id=int(user_id), name=name,
+                name_reasons=name_reasons, body_reasons=body_reasons,
                 surface="comment", ref_id=comment_id, post_id=post_id,
                 today_count=today_count, daily_cap=daily_cap,
                 dry_run=dry_run,
@@ -413,13 +539,11 @@ def run_scan(
             if int(user_id) in ALLOWLISTED_USER_IDS:
                 continue
 
-            reasons = _detect(name, body)
-            if not reasons:
-                continue
-
+            name_reasons, body_reasons = _detect(name, body, user_id=int(user_id))
             _record_candidate(
                 candidates, uncertain, acted_ids, state,
-                user_id=int(user_id), name=name, reasons=reasons,
+                user_id=int(user_id), name=name,
+                name_reasons=name_reasons, body_reasons=body_reasons,
                 surface="note_reply", ref_id=reply_id, post_id=None,
                 today_count=today_count, daily_cap=daily_cap,
                 dry_run=dry_run,
@@ -473,30 +597,50 @@ def run_scan(
 
 def _record_candidate(
     candidates, uncertain, acted_ids, state,
-    *, user_id, name, reasons, surface, ref_id, post_id,
+    *, user_id, name, name_reasons, body_reasons,
+    surface, ref_id, post_id,
     today_count, daily_cap, dry_run,
 ):
-    """Classify a match as actionable or uncertain; update state."""
+    """Classify a match as actionable (candidate) or uncertain; update state.
+
+    Routing:
+    - body_reasons only → always uncertain (never auto-reported, never counted
+      toward the daily cap).
+    - name_reasons (with or without body_reasons) → actionable candidate if
+      within daily cap and not already acted on; otherwise uncertain/cap_exceeded.
+    """
+    if not name_reasons and not body_reasons:
+        return
+
+    reasons = name_reasons + body_reasons
     reason_str = ", ".join(reasons)
     entry = {
         "user_id": user_id,
         "display_name": name,
         "reasons": reasons,
+        "name_reasons": name_reasons,
+        "body_reasons": body_reasons,
         "surface": surface,
         "ref_id": ref_id,
         "post_id": post_id,
     }
 
-    if user_id in acted_ids:
-        # Already reported in a previous run — skip (dedupe)
+    # Body-only → uncertain, never auto-reported, never counts toward cap
+    if not name_reasons:
+        entry["status"] = "body_only_review"
+        uncertain.append(entry)
         return
+
+    # Name-triggered: check dedupe and cap
+    if user_id in acted_ids:
+        return  # Already reported in a previous run — dedupe
 
     if _daily_count(state) >= daily_cap:
         entry["status"] = "cap_exceeded"
         uncertain.append(entry)
         return
 
-    # Within cap and not seen before
+    # Within cap, not seen before → actionable candidate
     if dry_run:
         entry["dry_run_call"] = _dry_run_report_user(user_id, reason_str)
     entry["status"] = "would_report"
@@ -520,13 +664,18 @@ def _write_summary(
 ) -> None:
     """Write the morning summary Markdown file."""
     mode = "DRY-RUN" if dry_run else "LIVE"
+    # Separate body-only uncertain from cap-exceeded uncertain
+    body_only = [u for u in uncertain if u.get("status") == "body_only_review"]
+    cap_exceeded = [u for u in uncertain if u.get("status") == "cap_exceeded"]
+
     lines = [
         f"# Capital Mischief Impersonation Scan — {today_str} ({mode})",
         "",
         f"**Posts scanned:** {posts_scanned}  ",
         f"**Notes scanned:** {notes_scanned}  ",
         f"**Candidates (would report):** {len(candidates)}  ",
-        f"**Uncertain (cap exceeded or pending review):** {len(uncertain)}  ",
+        f"**Uncertain — body-only (human review):** {len(body_only)}  ",
+        f"**Uncertain — cap exceeded:** {len(cap_exceeded)}  ",
         "",
     ]
 
@@ -540,17 +689,24 @@ def _write_summary(
             lines.append(f"- **user_id {uid}** — display name: `{name}` — triggers: {reasons}")
         lines.append("")
 
-    if uncertain:
-        lines.append("## Uncertain / Cap-Exceeded Items")
+    if body_only:
+        lines.append("## Body-Only Matches (Human Review — NOT auto-reported)")
         lines.append("")
-        for c in uncertain:
+        for c in body_only:
             uid = c["user_id"]
             name = c["display_name"]
             reasons = ", ".join(c["reasons"])
-            status = c.get("status", "unknown")
-            lines.append(
-                f"- user_id {uid} | `{name}` | {reasons} | status: {status}"
-            )
+            lines.append(f"- user_id {uid} | `{name}` | {reasons} | status: body_only_review")
+        lines.append("")
+
+    if cap_exceeded:
+        lines.append("## Cap-Exceeded Items")
+        lines.append("")
+        for c in cap_exceeded:
+            uid = c["user_id"]
+            name = c["display_name"]
+            reasons = ", ".join(c["reasons"])
+            lines.append(f"- user_id {uid} | `{name}` | {reasons} | status: cap_exceeded")
         lines.append("")
 
     lines += [
