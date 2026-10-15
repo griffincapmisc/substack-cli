@@ -193,6 +193,51 @@ def _parse_since(value: str) -> datetime:
 # Core operations
 # ---------------------------------------------------------------------------
 
+def _validate_url(url: str) -> None:
+    """Raise ValueError if *url* is not an http/https URL."""
+    if not url.startswith(("http://", "https://")):
+        raise ValueError(
+            f"Invalid URL {url!r}: --link requires an http or https URL."
+        )
+
+
+def create_note_link_attachment(client: SubstackClient, url: str) -> str:
+    """Register a link (URL) as a Note attachment and return its attachment id.
+
+    Sends POST /api/v1/comment/attachment on host "A" with
+    ``{"url": "<url>", "type": "link"}``.  For Substack post URLs the API
+    returns ``{"id": "<uuid>", "type": "post", "post": {...}}``.  For
+    non-Substack URLs the type is ``"link"`` but the ``id`` field is present
+    in both cases.
+
+    The returned id is passed in the note's ``attachmentIds`` list alongside
+    any image attachment ids.  All link attachments are created BEFORE the
+    note is posted, preserving the fail-before-publish property.
+
+    Ordering when both images and links are provided: image attachment ids
+    come first (in the order their ``--image`` flags appear), then link
+    attachment ids (in the order their ``--link`` flags appear).  Substack
+    renders the first attachment as the primary card, so callers who want a
+    link card to appear first should not mix it with images.
+
+    Raises SubstackApiError if the response contains no ``id`` field.
+    Raises ValueError for non-http/https URLs (validated before any network
+    call).
+    """
+    _validate_url(url)
+    attachment = client.post(
+        "/api/v1/comment/attachment",
+        host="A",
+        json_body={"url": url, "type": "link"},
+    )
+    attachment_id = attachment.get("id") if isinstance(attachment, dict) else None
+    if not attachment_id:
+        raise SubstackApiError(
+            f"Creating a link attachment for {url!r} returned no 'id' field."
+        )
+    return attachment_id
+
+
 def create_note_image_attachment(client: SubstackClient, image_path: str) -> str:
     uploaded = upload_image(client, image_path, host="A")
     url = uploaded.get("url") if isinstance(uploaded, dict) else None
@@ -218,9 +263,29 @@ def create_note(
     body_json: Optional[str] = None,
     reply_minimum_role: str = DEFAULT_REPLY_MINIMUM_ROLE,
     image_paths: Optional[List[str]] = None,
+    link_urls: Optional[List[str]] = None,
     draft: bool = False,
     trigger_at: Optional[str] = None,
 ) -> dict:
+    """Publish a Note, or save it as a draft.
+
+    `draft=True` saves to the Notes Drafts tab via POST /api/v1/comment/draft
+    instead of publishing. `trigger_at` (Substack's UTC format, see
+    `_parse_schedule`) schedules it: it is saved as a draft that Substack
+    publishes automatically at that time. A trigger_at implies draft.
+ `body_json` (a full ProseMirror doc) takes precedence
+    over `text`. The `bodyJson` is sent as a nested object, NOT stringified.
+
+    `image_paths` (local files) are uploaded and attached via
+    `attachmentIds`. `link_urls` (http/https URLs) are registered as link
+    attachments. All attachments are created BEFORE the note is posted, so a
+    failed attachment call never leaves a half-published note.
+
+    Ordering: image attachment ids come first (in ``--image`` flag order),
+    then link attachment ids (in ``--link`` flag order).
+
+    Requires SUBSTACK_ENABLE_WRITE=true (defense-in-depth — the command layer
+    also gates)."""
     if not is_write_enabled():
         raise ValueError(
             "Write operations require SUBSTACK_ENABLE_WRITE=true "
@@ -233,7 +298,13 @@ def create_note(
     else:
         raise ValueError("Provide note text or --body-json.")
     paths = _validate_image_paths(image_paths)
+    urls = list(link_urls or [])
+    for u in urls:
+        _validate_url(u)  # fail fast before any network call
+
     attachment_ids = [create_note_image_attachment(client, p) for p in paths]
+    attachment_ids += [create_note_link_attachment(client, u) for u in urls]
+
     body: dict = {"bodyJson": doc, "replyMinimumRole": reply_minimum_role}
     if attachment_ids:
         body["attachmentIds"] = attachment_ids
@@ -544,6 +615,14 @@ def notes_create_cmd(
         help="Local image file to attach (png/jpg/gif/webp). Repeat the flag "
         "to attach several. Uploaded before the note is posted.",
     ),
+    link: Optional[List[str]] = typer.Option(
+        None,
+        "--link",
+        help="URL to attach as a link/post card. Repeat the flag to attach "
+        "several. For Substack post URLs this renders as a post card; for "
+        "other URLs it renders as a link preview. Registered before the note "
+        "is posted. Image attachments appear first, then link attachments.",
+    ),
     reply_min_role: str = typer.Option(
         DEFAULT_REPLY_MINIMUM_ROLE,
         "--reply-min-role",
@@ -562,7 +641,14 @@ def notes_create_cmd(
     yes: bool = typer.Option(False, "--yes", help="Confirm publishing."),
     pretty: bool = False,
 ):
-    """Publish a Note, save as draft (--draft), or schedule (--schedule)."""
+    """Publish a Note, save as draft (--draft), or schedule (--schedule).
+
+    Published notes go out IMMEDIATELY and CANNOT be edited (only deleted), so
+    publishing requires --yes. --draft saves privately to the Drafts tab of the
+    Notes composer (no --yes needed). --schedule auto-publishes later, so it
+    also requires --yes. Attach images with --image; attach link/post cards
+    with --link (repeat either flag for multiple attachments).
+    """
     if text is None and body_json is None:
         emit_error("Provide note text or --body-json.", pretty=pretty)
     trigger_at = None
@@ -592,7 +678,9 @@ def notes_create_cmd(
             pretty=pretty,
         )
     try:
-        _validate_image_paths(image)
+        _validate_image_paths(image)  # fail fast, before auth or any HTTP
+        for u in list(link or []):
+            _validate_url(u)  # fail fast, before auth or any HTTP
         client = _make_client()
         result = create_note(
             client,
@@ -600,6 +688,7 @@ def notes_create_cmd(
             body_json=body_json,
             reply_minimum_role=reply_min_role,
             image_paths=image,
+            link_urls=link,
             draft=draft,
             trigger_at=trigger_at,
         )
