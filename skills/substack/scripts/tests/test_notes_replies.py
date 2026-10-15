@@ -557,3 +557,124 @@ def test_cli_notes_list_all_requires_mine_or_user_id(isolated_config, authed_env
 def test_cli_notes_list_bad_since(isolated_config, authed_env, cli_runner):
     result = cli_runner.invoke(notes_app, ["list", "--mine", "--all", "--since", "not-a-date"])
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# NEW: wrapped descendantComments normalisation (bug fix tests)
+# ---------------------------------------------------------------------------
+
+def _wrapped(cid: int, **extra) -> dict:
+    """Simulate the real API shape: {type:'comment', comment:{...}}."""
+    inner = {"id": cid, "body": f"reply {cid}", "children_count": 0}
+    inner.update(extra)
+    return {"type": "comment", "comment": inner}
+
+
+def _bare(cid: int, **extra) -> dict:
+    inner = {"id": cid, "body": f"reply {cid}", "children_count": 0}
+    inner.update(extra)
+    return inner
+
+
+@respx.mock
+def test_descendants_wrapped_inline_gets_unwrapped(fake_cookies, fake_publication_url):
+    """Inline descendantComments that are {type,comment} wrapped must be normalised to bare."""
+    page = _page([{
+        "comment": {"id": 10, "body": "root branch", "children_count": 0},
+        # Inline entries from real API come wrapped
+        "descendantComments": [_wrapped(20), _wrapped(21)],
+    }])
+    respx.get(REPLIES_URL_TEMPLATE.format(id=5)).mock(
+        return_value=httpx.Response(200, json=page)
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    result = get_note_replies(client, 5, fetch_descendants=True)
+    descs = result["commentBranches"][0]["descendantComments"]
+    assert len(descs) == 2
+    # Every entry must be a bare dict (has id at top level, no 'type'/'comment' wrapper)
+    for d in descs:
+        assert "id" in d, f"entry missing top-level id: {d}"
+        assert d.get("type") != "comment" or "comment" not in d, f"entry still wrapped: {d}"
+    assert [d["id"] for d in descs] == [20, 21]
+
+
+@respx.mock
+def test_descendants_mixed_inline_and_fetched_yields_bare(fake_cookies, fake_publication_url):
+    """Mixed inline (wrapped) + recursively fetched entries both come out as bare dicts."""
+    # Branch 10 has children_count=2 but only 1 inline (wrapped) descendant → triggers fetch
+    page = _page([{
+        "comment": {"id": 10, "body": "branch", "children_count": 2},
+        "descendantComments": [_wrapped(20)],  # only 1, children_count=2 → recurse
+    }])
+    respx.get(REPLIES_URL_TEMPLATE.format(id=5)).mock(
+        return_value=httpx.Response(200, json=page)
+    )
+    # Recursive fetch for comment 10 returns branch 30 with wrapped inline descendant 31
+    respx.get(REPLIES_URL_TEMPLATE.format(id=10)).mock(
+        return_value=httpx.Response(200, json=_page([{
+            "comment": {"id": 30, "body": "deep branch", "children_count": 0},
+            "descendantComments": [_wrapped(31)],
+        }]))
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    result = get_note_replies(client, 5, fetch_descendants=True)
+    descs = result["commentBranches"][0]["descendantComments"]
+    # Should contain bare dicts for 30 and 31 (depth-first: sub_branch comment then its descs)
+    assert all("id" in d for d in descs), f"not all bare: {descs}"
+    assert all(not ("type" in d and "comment" in d and "id" not in d) for d in descs), \
+        f"some still wrapped: {descs}"
+    ids = [d["id"] for d in descs]
+    assert ids == [30, 31], f"expected [30, 31], got {ids}"
+
+
+@respx.mock
+def test_descendants_deduplication_preserves_order(fake_cookies, fake_publication_url):
+    """Duplicate ids (same entry from inline + fetch) are deduped, first-seen wins."""
+    # children_count=2 but 2 inline wrapped entries → len(existing)==2 == children_count → no fetch
+    page = _page([{
+        "comment": {"id": 10, "body": "branch", "children_count": 0},
+        "descendantComments": [_wrapped(20), _wrapped(20), _wrapped(21)],  # 20 duplicated
+    }])
+    respx.get(REPLIES_URL_TEMPLATE.format(id=5)).mock(
+        return_value=httpx.Response(200, json=page)
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    result = get_note_replies(client, 5, fetch_descendants=True)
+    descs = result["commentBranches"][0]["descendantComments"]
+    assert [d["id"] for d in descs] == [20, 21], f"expected deduped [20,21], got {descs}"
+
+
+@respx.mock
+def test_no_descendants_flag_leaves_raw_untouched(fake_cookies, fake_publication_url):
+    """Without --descendants, descendantComments must be returned exactly as the API gave them."""
+    wrapped_entry = _wrapped(20)
+    page = _page([{
+        "comment": {"id": 10, "body": "branch", "children_count": 1},
+        "descendantComments": [wrapped_entry],
+    }])
+    respx.get(REPLIES_URL_TEMPLATE.format(id=5)).mock(
+        return_value=httpx.Response(200, json=page)
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    # Default: no fetch_descendants
+    result = get_note_replies(client, 5)
+    descs = result["commentBranches"][0]["descendantComments"]
+    # Raw API shape preserved — entry is still wrapped
+    assert descs[0] == wrapped_entry, f"raw entry was mutated: {descs[0]}"
+
+
+@respx.mock
+def test_descendants_already_bare_inline_not_double_unwrapped(fake_cookies, fake_publication_url):
+    """Already-bare inline entries must survive _normalize_descendants unchanged."""
+    page = _page([{
+        "comment": {"id": 10, "body": "branch", "children_count": 0},
+        "descendantComments": [_bare(20), _bare(21)],
+    }])
+    respx.get(REPLIES_URL_TEMPLATE.format(id=5)).mock(
+        return_value=httpx.Response(200, json=page)
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    result = get_note_replies(client, 5, fetch_descendants=True)
+    descs = result["commentBranches"][0]["descendantComments"]
+    assert [d["id"] for d in descs] == [20, 21]
+    assert all("id" in d for d in descs)

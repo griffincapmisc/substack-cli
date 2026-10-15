@@ -68,6 +68,33 @@ _DESCENDANTS_MAX_DEPTH = 5
 _DESCENDANTS_MAX_REQUESTS = 200
 
 
+def _unwrap_comment(entry: dict) -> dict:
+    """Normalize a descendantComments entry to a bare comment dict.
+
+    The /api/v1/reader/comment/{id}/replies endpoint returns descendantComments
+    entries wrapped as {"type": "comment", "comment": {...fields...}}.
+    Some callers may pass already-bare dicts (e.g. from a previous normalisation
+    pass).  This function handles both shapes and always returns the bare dict.
+    """
+    if entry.get("type") == "comment" and "comment" in entry and "id" not in entry:
+        return entry["comment"]
+    return entry
+
+
+def _normalize_descendants(entries: list) -> list:
+    """Unwrap all entries, dedupe by id preserving first-seen order."""
+    seen: dict = {}
+    for raw in entries:
+        bare = _unwrap_comment(raw)
+        cid = bare.get("id")
+        if cid is not None and cid not in seen:
+            seen[cid] = bare
+        elif cid is None:
+            # No id — include as-is to avoid silent data loss
+            seen[id(bare)] = bare
+    return list(seen.values())
+
+
 # ---------------------------------------------------------------------------
 # Body builder
 # ---------------------------------------------------------------------------
@@ -419,8 +446,20 @@ def get_note_replies(
             for branch in branches:
                 comment = branch.get("comment") or {}
                 children_count = comment.get("children_count", 0) or 0
-                existing = branch.get("descendantComments") or []
-                if children_count > len(existing):
+                # Normalise inline descendantComments to bare dicts now
+                # so the children_count comparison is meaningful and the output
+                # is uniform whether or not we recurse.
+                existing = _normalize_descendants(
+                    branch.get("descendantComments") or []
+                )
+                branch["descendantComments"] = existing
+                # children_count = direct children of this comment.
+                # existing is a flat list of ALL descendants (direct + deeper),
+                # so existing may be longer than children_count even when complete.
+                # Correct trigger: recurse when children_count > 0 and we have
+                # fewer entries than children_count (meaning at least one direct
+                # child is missing entirely from the inline list).
+                if children_count > 0 and len(existing) < children_count:
                     if _request_counter[0] >= _DESCENDANTS_MAX_REQUESTS:
                         truncated = True
                         continue
@@ -437,14 +476,28 @@ def get_note_replies(
                     )
                     if sub.get("truncated"):
                         truncated = True
-                    # Flatten depth-first: branch comment -> its descendants
+                    # Flatten depth-first: branch comment -> its descendants.
+                    # sub_branch["comment"] is already a bare dict (the branch
+                    # wrapper uses {"comment":{...}} not the wrapped API shape).
+                    # sub_branch["descendantComments"] entries come from the API
+                    # and may be wrapped as {type,comment}; normalise them.
                     flat: List[dict] = []
                     for sub_branch in (sub.get("commentBranches") or []) + (
                         sub.get("automodHiddenBranches") or []
                     ):
-                        flat.append(sub_branch.get("comment") or {})
-                        flat.extend(sub_branch.get("descendantComments") or [])
-                    branch["descendantComments"] = flat
+                        sub_comment = sub_branch.get("comment") or {}
+                        if sub_comment.get("id") is not None:
+                            flat.append(sub_comment)
+                        flat.extend(
+                            _normalize_descendants(
+                                sub_branch.get("descendantComments") or []
+                            )
+                        )
+                    branch["descendantComments"] = _normalize_descendants(
+                        # Also normalise whatever inline entries already existed
+                        # before we overwrote them, then fold in fetched ones.
+                        flat
+                    )
 
         _expand_branches(cb)
         _expand_branches(ah)
