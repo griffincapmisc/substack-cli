@@ -295,6 +295,7 @@ SUBSTACK_ENABLE_WRITE=true substack comments ban <COMMENT_ID> \
 | `report_context` body shape | Not found in bundle. Field accepted as optional `--report-context <JSON>` string; omit in most cases. |
 | `expiry` format | Confirmed enum `1d`/`30d`/`90d`/`1y`/`1000y` from the ban modal's select options. Not yet live-verified. |
 | `commentVisibility` enum | Confirmed `visible` / `delete_this_comment` / `delete_all_comments` from the ban modal's select options. |
+| Host for comment report | Publication host (`charliepgarcia.substack.com`). Notes UI uses `substack.com` — if a comment is on Notes, the CLI may need `--host A` (not yet exposed). |
 | Host for Notes replies | All Notes endpoints (including `notes replies` and `notes list --all`) use `substack.com` (host A) automatically — no `--host` flag needed. |
 | Profile report live response shape | Unknown; the endpoint exists per bundle but has not been called with real credentials. |
 

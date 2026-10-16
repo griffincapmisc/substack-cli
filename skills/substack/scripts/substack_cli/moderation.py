@@ -22,7 +22,7 @@ from substack_cli.client import (
     emit_error,
     output,
 )
-from substack_cli.moderation_helpers import _dry_run_output, _make_client
+from substack_cli.moderation_helpers import _dry_run_output, _make_client, moderation_app  # noqa: F401
 from substack_cli.moderation_core import (
     VALID_CATEGORIES,
     VALID_EXPIRIES,
@@ -31,19 +31,12 @@ from substack_cli.moderation_core import (
     build_ban_body,
     build_profile_report_body,
     build_report_body,
-    get_delete_reasons,
-    get_report_categories,
-    get_user_bans,
     report_comment,
     report_note_reply,
     report_user_profile,
 )
 
-moderation_app = typer.Typer(
-    help="Comment moderation helpers: report categories, delete reasons.",
-    no_args_is_help=True,
-)
-app.add_typer(moderation_app, name="moderation")
+
 
 # ---------------------------------------------------------------------------
 # CLI: comments report
@@ -111,12 +104,14 @@ def comments_report_cmd(
         return
     if not is_write_enabled():
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
+        return
     if category not in VALID_CATEGORIES:
         emit_error(
             f"Invalid --category {category!r}. "
             f"Valid values: {sorted(VALID_CATEGORIES)}",
             pretty=pretty,
         )
+        return
 
     try:
         body = build_report_body(
@@ -195,12 +190,14 @@ def comments_report_user_cmd(
     """Report a user's profile. Dry-run by default."""
     if not is_write_enabled():
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
+        return
     if category not in VALID_CATEGORIES:
         emit_error(
             f"Invalid --category {category!r}. "
             f"Valid values: {sorted(VALID_CATEGORIES)}",
             pretty=pretty,
         )
+        return
 
     try:
         body = build_profile_report_body(category, details, to_substack, report_context)
@@ -261,17 +258,20 @@ def comments_ban_cmd(
     """Ban a commenter by comment ID. Dry-run by default."""
     if not is_write_enabled():
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
+        return
     if visibility not in VALID_VISIBILITIES:
         emit_error(
             f"Invalid --visibility {visibility!r}. "
             f"Must be one of: {sorted(VALID_VISIBILITIES)}",
             pretty=pretty,
         )
+        return
     if expiry not in VALID_EXPIRIES:
         emit_error(
             f"Invalid --expiry {expiry!r}. Must be one of: {sorted(VALID_EXPIRIES)}",
             pretty=pretty,
         )
+        return
 
     try:
         body = build_ban_body(user_id, expiry, visibility)
@@ -291,60 +291,3 @@ def comments_ban_cmd(
     except Exception as exc:
         emit_error(f"Unexpected error: {exc}", pretty=pretty)
 
-
-# ---------------------------------------------------------------------------
-# CLI: comments bans  (READ-ONLY)
-# ---------------------------------------------------------------------------
-
-@comments_app.command("bans")
-def comments_bans_cmd(
-    user_id: int = typer.Argument(..., help="User ID to look up bans for."),
-    pretty: bool = typer.Option(False, "--pretty"),
-):
-    """List existing bans for a user (read-only). GET /api/v1/user/{user_id}/bans."""
-    try:
-        client = _make_client()
-        result = get_user_bans(client, user_id)
-        output(result, pretty=pretty)
-    except (SubstackApiError, AuthError) as exc:
-        emit_error(str(exc), status_code=getattr(exc, "status_code", None), pretty=pretty)
-    except Exception as exc:
-        emit_error(f"Unexpected error: {exc}", pretty=pretty)
-
-
-# ---------------------------------------------------------------------------
-# CLI: moderation report-categories  (READ-ONLY)
-# ---------------------------------------------------------------------------
-
-@moderation_app.command("report-categories")
-def moderation_report_categories_cmd(
-    pretty: bool = typer.Option(False, "--pretty"),
-):
-    """Fetch Substack's reporting flow tree (report categories). Read-only."""
-    try:
-        client = _make_client()
-        result = get_report_categories(client)
-        output(result, pretty=pretty)
-    except (SubstackApiError, AuthError) as exc:
-        emit_error(str(exc), status_code=getattr(exc, "status_code", None), pretty=pretty)
-    except Exception as exc:
-        emit_error(f"Unexpected error: {exc}", pretty=pretty)
-
-
-# ---------------------------------------------------------------------------
-# CLI: moderation delete-reasons  (READ-ONLY)
-# ---------------------------------------------------------------------------
-
-@moderation_app.command("delete-reasons")
-def moderation_delete_reasons_cmd(
-    pretty: bool = typer.Option(False, "--pretty"),
-):
-    """Fetch comment deletion reason codes. Read-only."""
-    try:
-        client = _make_client()
-        result = get_delete_reasons(client)
-        output(result, pretty=pretty)
-    except (SubstackApiError, AuthError) as exc:
-        emit_error(str(exc), status_code=getattr(exc, "status_code", None), pretty=pretty)
-    except Exception as exc:
-        emit_error(f"Unexpected error: {exc}", pretty=pretty)
