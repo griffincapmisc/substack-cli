@@ -119,12 +119,14 @@ def comments_report_cmd(
     """Report a comment by ID. Dry-run by default (prints request without sending)."""
     if not is_write_enabled():
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
+        return
     if category not in VALID_CATEGORIES:
         emit_error(
             f"Invalid --category {category!r}. "
             f"Valid values: {sorted(VALID_CATEGORIES)}",
             pretty=pretty,
         )
+        return
 
     try:
         body = build_report_body(
@@ -193,12 +195,14 @@ def comments_report_user_cmd(
     """Report a user's profile. Dry-run by default."""
     if not is_write_enabled():
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
+        return
     if category not in VALID_CATEGORIES:
         emit_error(
             f"Invalid --category {category!r}. "
             f"Valid values: {sorted(VALID_CATEGORIES)}",
             pretty=pretty,
         )
+        return
 
     try:
         body = build_profile_report_body(category, details, to_substack, report_context)
@@ -259,17 +263,20 @@ def comments_ban_cmd(
     """Ban a commenter by comment ID. Dry-run by default."""
     if not is_write_enabled():
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
+        return
     if visibility not in VALID_VISIBILITIES:
         emit_error(
             f"Invalid --visibility {visibility!r}. "
             f"Must be one of: {sorted(VALID_VISIBILITIES)}",
             pretty=pretty,
         )
+        return
     if expiry not in VALID_EXPIRIES:
         emit_error(
             f"Invalid --expiry {expiry!r}. Must be one of: {sorted(VALID_EXPIRIES)}",
             pretty=pretty,
         )
+        return
 
     try:
         body = build_ban_body(user_id, expiry, visibility)

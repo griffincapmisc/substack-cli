@@ -163,9 +163,12 @@ _WHATSAPP_RE = re.compile(
     r"whatsapp|whats\s*app|wa\.me|api\.whatsapp",
     re.IGNORECASE,
 )
-_TELEGRAM_RE = re.compile(
-    r"telegram|t\.me/|@[A-Za-z0-9_]{4,}",  # Telegram handle or t.me link
+_TELEGRAM_URL_RE = re.compile(
+    r"telegram|(?<![a-z_])tg\b|t\.me/",  # Telegram keyword/abbrev or t.me link (always a signal)
     re.IGNORECASE,
+)
+_TELEGRAM_HANDLE_RE = re.compile(
+    r"@[A-Za-z0-9_]{4,}",  # bare @handle — only meaningful with Telegram context
 )
 _PHONE_RE = re.compile(
     # International phone: +1 672 906 6441, +16729066441, (672) 906-6441, etc.
@@ -224,7 +227,7 @@ def _body_has_contact_lure(body: str) -> bool:
     paired with the platform keyword.
     """
     has_whatsapp = bool(_WHATSAPP_RE.search(body))
-    has_telegram = bool(_TELEGRAM_RE.search(body))
+    has_telegram = bool(_TELEGRAM_URL_RE.search(body) or _TELEGRAM_HANDLE_RE.search(body))
     if not (has_whatsapp or has_telegram):
         return False
 
@@ -286,8 +289,14 @@ def _detect(name: str, body: str, *, user_id: Optional[int] = None) -> tuple[lis
     # ---- Name rules (contact lures) ----
     if _WHATSAPP_RE.search(name):
         name_reasons.append("whatsapp_contact")
-    if _TELEGRAM_RE.search(name):
+    _tg_url = bool(_TELEGRAM_URL_RE.search(name))
+    _tg_handle = bool(_TELEGRAM_HANDLE_RE.search(name))
+    # Flag telegram_contact only when Telegram context is present (URL/keyword),
+    # OR when both a t.me/ link and a @handle appear together.
+    # A bare @handle alone (no "telegram"/"tg"/t.me/) does NOT trigger.
+    if _tg_url or (_tg_handle and "t.me/" in name.lower()):
         name_reasons.append("telegram_contact")
+    # bare @handle with no Telegram context → do not flag
     if _PHONE_RE.search(name):
         name_reasons.append("phone_number")
 
@@ -306,7 +315,7 @@ def _detect(name: str, body: str, *, user_id: Optional[int] = None) -> tuple[lis
 
     # Rule C: 'charlie' in name AND contact lure also in name
     if _CHARLIE_NORM in norm_name and (
-        _WHATSAPP_RE.search(name) or _TELEGRAM_RE.search(name) or _PHONE_RE.search(name)
+        _WHATSAPP_RE.search(name) or _TELEGRAM_URL_RE.search(name) or _TELEGRAM_HANDLE_RE.search(name) or _PHONE_RE.search(name)
     ):
         name_reasons.append("charlie_with_lure_name")
 
@@ -329,8 +338,10 @@ def _load_seen() -> dict:
     if SEEN_FILE.exists():
         try:
             return json.loads(SEEN_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError:
             pass
+        except OSError as exc:
+            print(f"[impersonation] Warning: could not read seen-state {SEEN_FILE}: {exc}", flush=True)
     return {"acted_user_ids": [], "daily_counts": {}}
 
 
@@ -413,10 +424,11 @@ def run_scan(
     # --- Safety assertion ---
     if dry_run:
         write_env = os.environ.get("SUBSTACK_ENABLE_WRITE", "").strip().lower()
-        assert write_env != "true", (
-            "SAFETY ABORT: SUBSTACK_ENABLE_WRITE=true is set but --dry-run is active. "
-            "Unset SUBSTACK_ENABLE_WRITE before running in dry-run mode."
-        )
+        if write_env == "true":
+            raise RuntimeError(
+                "SAFETY ABORT: SUBSTACK_ENABLE_WRITE=true is set but --dry-run is active. "
+                "Unset SUBSTACK_ENABLE_WRITE before running in dry-run mode."
+            )
 
     state = _load_seen()
     acted_ids: set[int] = set(state.get("acted_user_ids", []))
@@ -486,10 +498,9 @@ def run_scan(
                 user_id=int(user_id), name=name,
                 name_reasons=name_reasons, body_reasons=body_reasons,
                 surface="comment", ref_id=comment_id, post_id=post_id,
-                today_count=today_count, daily_cap=daily_cap,
+                daily_cap=daily_cap,
                 dry_run=dry_run,
             )
-            today_count = _daily_count(state)
 
     # ------------------------------------------------------------------ #
     # 2. Scan Charlie's Notes replies                                     #
@@ -519,7 +530,7 @@ def run_scan(
             continue
         item = item_wrapper.get("item") or item_wrapper
         note_comment = item.get("comment") or {}
-        note_id = note_comment.get("id") or item_wrapper.get("entity_key", "").lstrip("c-")
+        note_id = note_comment.get("id") or item_wrapper.get("entity_key", "").removeprefix("c-")
         if not note_id:
             continue
 
@@ -545,10 +556,9 @@ def run_scan(
                 user_id=int(user_id), name=name,
                 name_reasons=name_reasons, body_reasons=body_reasons,
                 surface="note_reply", ref_id=reply_id, post_id=None,
-                today_count=today_count, daily_cap=daily_cap,
+                daily_cap=daily_cap,
                 dry_run=dry_run,
             )
-            today_count = _daily_count(state)
 
     # ------------------------------------------------------------------ #
     # 3. Persist state + write outputs                                    #
@@ -599,7 +609,7 @@ def _record_candidate(
     candidates, uncertain, acted_ids, state,
     *, user_id, name, name_reasons, body_reasons,
     surface, ref_id, post_id,
-    today_count, daily_cap, dry_run,
+    daily_cap, dry_run,
 ):
     """Classify a match as actionable (candidate) or uncertain; update state.
 

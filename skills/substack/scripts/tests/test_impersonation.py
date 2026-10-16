@@ -43,6 +43,7 @@ Covers:
     - daily cap shunts name-triggered to uncertain/cap_exceeded
     - dedupe skips already-acted user
 """
+import os
 import pytest
 import unittest.mock as mock
 
@@ -223,9 +224,15 @@ class TestDetectPositiveName:
         name_r, _ = _detect("Charlie WhatsApp Investor", "", user_id=99999)
         assert "whatsapp_contact" in name_r
 
-    def test_telegram_handle_in_name(self):
-        name_r, _ = _detect("Charlie Garcia @CharlieOfficial_tg", "", user_id=99999)
+    def test_telegram_handle_with_tme_link_in_name(self):
+        """@handle + t.me/ link → telegram_contact flagged (Telegram context present)"""
+        name_r, _ = _detect("Charlie Garcia t.me/charlie @CharlieOfficial", "", user_id=99999)
         assert "telegram_contact" in name_r
+
+    def test_telegram_handle_alone_in_name_not_flagged(self):
+        """@handle alone (no t.me/ or 'telegram' keyword) → telegram_contact NOT flagged"""
+        name_r, _ = _detect("Charlie Garcia @CharlieOfficial_tg", "", user_id=99999)
+        assert "telegram_contact" not in name_r
 
     def test_phone_in_name(self):
         name_r, _ = _detect("Charlie +16729066441", "", user_id=99999)
@@ -376,6 +383,7 @@ class TestWalkComments:
 
 # ---------------------------------------------------------------------------
 # _record_candidate — routing, daily cap, dedupe
+# (today_count param removed from signature — Fix E)
 # ---------------------------------------------------------------------------
 
 class TestRecordCandidate:
@@ -391,7 +399,7 @@ class TestRecordCandidate:
             user_id=999, name="Test User",
             name_reasons=["whatsapp_contact"], body_reasons=[],
             surface="comment", ref_id=1, post_id=1,
-            today_count=0, daily_cap=20, dry_run=True,
+            daily_cap=20, dry_run=True,
         )
         assert len(candidates) == 1
         assert candidates[0]["status"] == "would_report"
@@ -408,7 +416,7 @@ class TestRecordCandidate:
             user_id=777, name="Ellen",
             name_reasons=[], body_reasons=["body_contact_lure"],
             surface="comment", ref_id=2, post_id=2,
-            today_count=0, daily_cap=20, dry_run=True,
+            daily_cap=20, dry_run=True,
         )
         assert candidates == []
         assert len(uncertain) == 1
@@ -426,7 +434,7 @@ class TestRecordCandidate:
             user_id=111, name="Charlie Garcia",
             name_reasons=["charlie_garcia_name"], body_reasons=[],
             surface="comment", ref_id=10, post_id=10,
-            today_count=0, daily_cap=1, dry_run=True,
+            daily_cap=1, dry_run=True,
         )
         assert len(candidates) == 1
         # now a body-only should still go to uncertain, not cap_exceeded
@@ -435,7 +443,7 @@ class TestRecordCandidate:
             user_id=222, name="Ellen",
             name_reasons=[], body_reasons=["body_contact_lure"],
             surface="comment", ref_id=11, post_id=10,
-            today_count=1, daily_cap=1, dry_run=True,
+            daily_cap=1, dry_run=True,
         )
         assert len(candidates) == 1  # no new candidate
         assert uncertain[0]["status"] == "body_only_review"  # not cap_exceeded
@@ -450,7 +458,7 @@ class TestRecordCandidate:
             user_id=333, name="Charlie Garcia",
             name_reasons=["charlie_garcia_name"], body_reasons=["body_contact_lure"],
             surface="comment", ref_id=3, post_id=3,
-            today_count=0, daily_cap=20, dry_run=True,
+            daily_cap=20, dry_run=True,
         )
         assert len(candidates) == 1
         assert candidates[0]["status"] == "would_report"
@@ -465,7 +473,7 @@ class TestRecordCandidate:
             user_id=999, name="Test User",
             name_reasons=["whatsapp_contact"], body_reasons=[],
             surface="comment", ref_id=1, post_id=1,
-            today_count=0, daily_cap=20, dry_run=True,
+            daily_cap=20, dry_run=True,
         )
         assert candidates == []
         assert uncertain == []
@@ -480,7 +488,7 @@ class TestRecordCandidate:
                 user_id=888, name="Cap Test",
                 name_reasons=["phone_number"], body_reasons=[],
                 surface="comment", ref_id=2, post_id=2,
-                today_count=20, daily_cap=20, dry_run=True,
+                daily_cap=20, dry_run=True,
             )
         assert candidates == []
         assert len(uncertain) == 1
@@ -496,7 +504,87 @@ class TestRecordCandidate:
             user_id=555, name="Nobody",
             name_reasons=[], body_reasons=[],
             surface="comment", ref_id=5, post_id=5,
-            today_count=0, daily_cap=20, dry_run=True,
+            daily_cap=20, dry_run=True,
         )
         assert candidates == []
         assert uncertain == []
+
+
+# ---------------------------------------------------------------------------
+# Fix A — Telegram false-positive: require Telegram context
+# ---------------------------------------------------------------------------
+
+class TestDetectTelegramContextRequired:
+    def test_bare_handle_no_telegram_context_not_flagged(self):
+        """@CharlieFan2024 alone — no t.me/ or 'telegram' → telegram_contact NOT flagged"""
+        name_r, _ = _detect("@CharlieFan2024", "", user_id=99999)
+        assert "telegram_contact" not in name_r
+
+    def test_tme_link_with_handle_flagged(self):
+        """t.me/charlie @CharlieOfficial — has t.me/ context → telegram_contact flagged"""
+        name_r, _ = _detect("t.me/charlie @CharlieOfficial", "", user_id=99999)
+        assert "telegram_contact" in name_r
+
+    def test_telegram_keyword_with_handle_flagged(self):
+        """'Charlie telegram @charlie_official' — has 'telegram' keyword → flagged"""
+        name_r, _ = _detect("Charlie telegram @charlie_official", "", user_id=99999)
+        assert "telegram_contact" in name_r
+
+    def test_tme_link_alone_flagged(self):
+        """t.me/charliegarcia_official alone — t.me/ is always a signal"""
+        name_r, _ = _detect("t.me/charliegarcia_official", "", user_id=99999)
+        assert "telegram_contact" in name_r
+
+    def test_telegram_keyword_alone_flagged(self):
+        """'Charlie telegram support' — 'telegram' keyword alone is sufficient"""
+        name_r, _ = _detect("Charlie telegram support", "", user_id=99999)
+        assert "telegram_contact" in name_r
+
+
+# ---------------------------------------------------------------------------
+# Fix B — assert → RuntimeError for dry-run + SUBSTACK_ENABLE_WRITE=true
+# ---------------------------------------------------------------------------
+
+class TestSafetyAbortCheck:
+    def test_dry_run_with_write_env_raises(self):
+        """SUBSTACK_ENABLE_WRITE=true + dry_run=True → RuntimeError with SAFETY ABORT"""
+        with mock.patch.dict(os.environ, {"SUBSTACK_ENABLE_WRITE": "true"}):
+            with pytest.raises(RuntimeError, match="SAFETY ABORT"):
+                from substack_cli.impersonation import run_scan
+                # Use a minimal mock client; the check fires before any client calls
+                run_scan(mock.MagicMock(), post_limit=0, notes_limit=0, dry_run=True)
+
+    def test_dry_run_without_write_env_no_raise(self):
+        """SUBSTACK_ENABLE_WRITE unset + dry_run=True → no RuntimeError"""
+        env = {k: v for k, v in os.environ.items() if k != "SUBSTACK_ENABLE_WRITE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            from substack_cli.impersonation import run_scan
+            client = mock.MagicMock()
+            # archive returns empty list → scan completes without network
+            client.get.return_value = []
+            # Should not raise
+            result = run_scan(client, post_limit=0, notes_limit=0, dry_run=True)
+            assert "posts_scanned" in result
+
+
+# ---------------------------------------------------------------------------
+# Fix C — removeprefix vs lstrip correctness
+# ---------------------------------------------------------------------------
+
+class TestRemovePrefix:
+    def test_entity_key_with_c_dash_prefix(self):
+        assert "c-12345".removeprefix("c-") == "12345"
+
+    def test_entity_key_without_prefix_unchanged(self):
+        assert "12345".removeprefix("c-") == "12345"
+
+    def test_entity_key_c_alone_unchanged(self):
+        """'c12345' has no dash after c — removeprefix leaves it intact"""
+        assert "c12345".removeprefix("c-") == "c12345"
+
+    def test_lstrip_would_overconsume_but_removeprefix_does_not(self):
+        """lstrip('c-') would strip all leading c and - chars;
+        removeprefix('c-') only strips the exact prefix 'c-' once."""
+        assert "cc-12345".removeprefix("c-") == "cc-12345"
+        # Contrast: "cc-12345".lstrip("c-") would return "12345" (wrong)
+        assert "cc-12345".lstrip("c-") == "12345"

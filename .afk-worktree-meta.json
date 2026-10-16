@@ -1,0 +1,7 @@
+{
+  "owner": "agent",
+  "pid": 76135,
+  "createdAt": "2026-10-16T00:48:30.205Z",
+  "baseSha": "9881f22b84fb7116a93c52e419746f0ef5f124bb",
+  "baseBranch": "fork/feat/impersonation-scan"
+}
