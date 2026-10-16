@@ -16,7 +16,10 @@ from substack_cli.notes import (
     _make_client,
     _normalize_comment_id,
     _parse_schedule,
+    _strip_unsupported_marks_from_doc,
+    _strip_unsupported_note_marks,
     _text_to_note_doc,
+    _validate_reply_minimum_role,
     _validate_url,
     create_note,
     create_note_image_attachment,
@@ -50,18 +53,108 @@ def test_text_to_note_doc_blank_lines_split_paragraphs():
     assert doc["content"][1]["content"][0]["text"] == "Second para."
 
 
-def test_text_to_note_doc_parses_inline_marks():
+def test_text_to_note_doc_strips_bold_and_italic_keeps_link(capsys):
+    """bold/italic marks are stripped (Notes API 500s on them); link marks survive."""
     doc = _text_to_note_doc("**bold** and [link](https://x.com)")
     nodes = doc["content"][0]["content"]
-    bold = next(n for n in nodes if n.get("marks") and n["marks"][0]["type"] == "strong")
-    assert bold["text"] == "bold"
+    # bold text is kept as plain text — no strong mark
+    bold_node = next(n for n in nodes if n.get("text") == "bold")
+    assert "marks" not in bold_node or not any(
+        m["type"] == "strong" for m in bold_node.get("marks", [])
+    )
+    # link mark is preserved
     link = next(n for n in nodes if n.get("marks") and n["marks"][0]["type"] == "link")
     assert link["marks"][0]["attrs"]["href"] == "https://x.com"
+    # warning emitted to stderr
+    captured = capsys.readouterr()
+    assert "strong" in captured.err
+    assert "not supported" in captured.err
+
+
+def test_text_to_note_doc_strips_italic(capsys):
+    """*italic* marks are stripped; text is kept."""
+    doc = _text_to_note_doc("*hello*")
+    nodes = doc["content"][0]["content"]
+    assert nodes[0]["text"] == "hello"
+    assert "marks" not in nodes[0] or not any(
+        m["type"] == "em" for m in nodes[0].get("marks", [])
+    )
+    captured = capsys.readouterr()
+    assert "em" in captured.err
 
 
 def test_text_to_note_doc_empty_raises():
     with pytest.raises(ValueError):
         _text_to_note_doc("   \n\n  ")
+
+
+# ---------------------------------------------------------------------------
+# _strip_unsupported_note_marks
+# ---------------------------------------------------------------------------
+
+def test_strip_unsupported_note_marks_removes_strong(capsys):
+    nodes = [{"type": "text", "text": "bold", "marks": [{"type": "strong"}]}]
+    result = _strip_unsupported_note_marks(nodes)
+    assert result == [{"type": "text", "text": "bold"}]
+    assert "strong" in capsys.readouterr().err
+
+
+def test_strip_unsupported_note_marks_removes_em(capsys):
+    nodes = [{"type": "text", "text": "italic", "marks": [{"type": "em"}]}]
+    result = _strip_unsupported_note_marks(nodes)
+    assert result == [{"type": "text", "text": "italic"}]
+    assert "em" in capsys.readouterr().err
+
+
+def test_strip_unsupported_note_marks_preserves_link():
+    mark = {"type": "link", "attrs": {"href": "https://example.com"}}
+    nodes = [{"type": "text", "text": "click", "marks": [mark]}]
+    result = _strip_unsupported_note_marks(nodes)
+    assert result[0]["marks"] == [mark]
+
+
+def test_strip_unsupported_note_marks_plain_text_unchanged():
+    nodes = [{"type": "text", "text": "plain"}]
+    result = _strip_unsupported_note_marks(nodes)
+    assert result == [{"type": "text", "text": "plain"}]
+
+
+def test_strip_unsupported_note_marks_warns_once_per_type(capsys):
+    """Each mark type should only produce one warning even if it appears many times."""
+    nodes = [
+        {"type": "text", "text": "a", "marks": [{"type": "strong"}]},
+        {"type": "text", "text": "b", "marks": [{"type": "strong"}]},
+    ]
+    _strip_unsupported_note_marks(nodes)
+    err = capsys.readouterr().err
+    assert err.count("'strong'") == 1
+
+
+# ---------------------------------------------------------------------------
+# _validate_reply_minimum_role
+# ---------------------------------------------------------------------------
+
+def test_validate_reply_minimum_role_accepts_everyone():
+    assert _validate_reply_minimum_role("everyone") == "everyone"
+
+
+def test_validate_reply_minimum_role_accepts_paid_subscriber():
+    assert _validate_reply_minimum_role("paid_subscriber") == "paid_subscriber"
+
+
+def test_validate_reply_minimum_role_rejects_subscriber():
+    with pytest.raises(ValueError, match="subscriber"):
+        _validate_reply_minimum_role("subscriber")
+
+
+def test_validate_reply_minimum_role_rejects_founding():
+    with pytest.raises(ValueError, match="founding"):
+        _validate_reply_minimum_role("founding")
+
+
+def test_validate_reply_minimum_role_rejects_unknown():
+    with pytest.raises(ValueError, match="not a verified"):
+        _validate_reply_minimum_role("admin")
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +252,16 @@ def test_create_note_reply_min_role_override(
     create_note(client, text="Paid only", reply_minimum_role="paid_subscriber")
     sent = json.loads(route.calls[0].request.content)
     assert sent["replyMinimumRole"] == "paid_subscriber"
+
+
+@respx.mock
+def test_create_note_rejects_subscriber_role(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env
+):
+    """'subscriber' must be rejected client-side before any HTTP call."""
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    with pytest.raises(ValueError, match="subscriber"):
+        create_note(client, text="Hello", reply_minimum_role="subscriber")
 
 
 @respx.mock
@@ -488,6 +591,17 @@ def test_cli_create_refuses_without_write_gate(isolated_config, authed_env, cli_
     result = cli_runner.invoke(notes_app, ["create", "Hello", "--yes"])
     assert result.exit_code != 0
     assert "SUBSTACK_ENABLE_WRITE" in result.output
+
+
+def test_cli_create_rejects_invalid_reply_min_role(
+    isolated_config, authed_env, write_enabled_env, cli_runner
+):
+    """'subscriber' was rejected by the live API (issue #31); CLI must catch it first."""
+    result = cli_runner.invoke(
+        notes_app, ["create", "Hello", "--yes", "--reply-min-role", "subscriber"]
+    )
+    assert result.exit_code != 0
+    assert "subscriber" in result.output.lower()
 
 
 def test_cli_delete_refuses_without_yes(
@@ -919,3 +1033,168 @@ def test_cli_drafts_lists_unwrapped(isolated_config, authed_env, cli_runner):
     result = cli_runner.invoke(notes_app, ["drafts"])
     assert result.exit_code == 0, result.output
     assert [d["id"] for d in json.loads(result.stdout.strip())] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# body-json path: strong/em stripped at create_note and reply_to_note
+# ---------------------------------------------------------------------------
+
+def _doc_with_strong_top_level() -> dict:
+    """ProseMirror doc with a strong mark at the top paragraph level."""
+    return {
+        "type": "doc",
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "bold", "marks": [{"type": "strong"}]},
+                    {"type": "text", "text": " plain"},
+                ],
+            }
+        ],
+    }
+
+
+def _doc_with_em_nested_in_list() -> dict:
+    """ProseMirror doc with an em mark nested inside a list item."""
+    return {
+        "type": "doc",
+        "content": [
+            {
+                "type": "bulletList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "italic",
+                                        "marks": [{"type": "em"}],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+# -- unit tests for _strip_unsupported_marks_from_doc -----------------------
+
+def test_strip_marks_from_doc_removes_strong_top_level(capsys):
+    doc = _doc_with_strong_top_level()
+    result = _strip_unsupported_marks_from_doc(doc)
+    para_nodes = result["content"][0]["content"]
+    bold_node = para_nodes[0]
+    assert "marks" not in bold_node
+    assert bold_node["text"] == "bold"
+    assert para_nodes[1] == {"type": "text", "text": " plain"}
+    assert "strong" in capsys.readouterr().err
+
+
+def test_strip_marks_from_doc_removes_em_nested_in_list(capsys):
+    doc = _doc_with_em_nested_in_list()
+    result = _strip_unsupported_marks_from_doc(doc)
+    item_para = result["content"][0]["content"][0]["content"][0]
+    text_node = item_para["content"][0]
+    assert "marks" not in text_node
+    assert text_node["text"] == "italic"
+    assert "em" in capsys.readouterr().err
+
+
+def test_strip_marks_from_doc_preserves_link_mark():
+    doc = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "click",
+                        "marks": [{"type": "link", "attrs": {"href": "https://example.com"}}],
+                    }
+                ],
+            }
+        ],
+    }
+    result = _strip_unsupported_marks_from_doc(doc)
+    node = result["content"][0]["content"][0]
+    assert node["marks"][0]["type"] == "link"
+
+
+# -- integration: create_note body_json path strips marks in POST body -------
+
+@respx.mock
+def test_create_note_body_json_strong_stripped_in_post(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env, capsys
+):
+    """create_note with body_json containing a strong mark must strip it before POST."""
+    route = respx.post(f"{SUBSTACK_COM}/api/v1/comment/feed").mock(
+        return_value=httpx.Response(200, json={"id": 1})
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    doc = _doc_with_strong_top_level()
+    create_note(client, body_json=json.dumps(doc))
+    sent = json.loads(route.calls[0].request.content)
+    para_nodes = sent["bodyJson"]["content"][0]["content"]
+    assert "marks" not in para_nodes[0], "strong mark must be stripped before POST"
+    assert "strong" in capsys.readouterr().err
+
+
+@respx.mock
+def test_create_note_body_json_em_nested_stripped_in_post(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env, capsys
+):
+    """create_note with body_json containing a nested em mark must strip it before POST."""
+    route = respx.post(f"{SUBSTACK_COM}/api/v1/comment/feed").mock(
+        return_value=httpx.Response(200, json={"id": 1})
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    doc = _doc_with_em_nested_in_list()
+    create_note(client, body_json=json.dumps(doc))
+    sent = json.loads(route.calls[0].request.content)
+    text_node = sent["bodyJson"]["content"][0]["content"][0]["content"][0]["content"][0]
+    assert "marks" not in text_node, "em mark inside list item must be stripped before POST"
+    assert "em" in capsys.readouterr().err
+
+
+# -- integration: reply_to_note body_json path strips marks in POST body -----
+
+@respx.mock
+def test_reply_to_note_body_json_strong_stripped_in_post(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env, capsys
+):
+    """reply_to_note with body_json containing a strong mark must strip it before POST."""
+    route = respx.post(f"{SUBSTACK_COM}/api/v1/comment/feed").mock(
+        return_value=httpx.Response(200, json={"id": 1})
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    doc = _doc_with_strong_top_level()
+    reply_to_note(client, 100, body_json=json.dumps(doc))
+    sent = json.loads(route.calls[0].request.content)
+    para_nodes = sent["bodyJson"]["content"][0]["content"]
+    assert "marks" not in para_nodes[0], "strong mark must be stripped before POST"
+    assert "strong" in capsys.readouterr().err
+
+
+@respx.mock
+def test_reply_to_note_body_json_em_nested_stripped_in_post(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env, capsys
+):
+    """reply_to_note with body_json containing a nested em mark must strip it before POST."""
+    route = respx.post(f"{SUBSTACK_COM}/api/v1/comment/feed").mock(
+        return_value=httpx.Response(200, json={"id": 1})
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    doc = _doc_with_em_nested_in_list()
+    reply_to_note(client, 100, body_json=json.dumps(doc))
+    sent = json.loads(route.calls[0].request.content)
+    text_node = sent["bodyJson"]["content"][0]["content"][0]["content"][0]["content"][0]
+    assert "marks" not in text_node, "em mark inside list item must be stripped before POST"
+    assert "em" in capsys.readouterr().err
