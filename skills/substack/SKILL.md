@@ -152,6 +152,17 @@ substack comments list 204779662
 SUBSTACK_ENABLE_WRITE=true substack comments create 204779662 "Thanks for reading!"
 SUBSTACK_ENABLE_WRITE=true substack comments react 204779662 --emoji "🔄"
 SUBSTACK_ENABLE_WRITE=true substack comments delete 456 --yes --host A
+
+# Moderation — all write commands default to dry-run; add --yes / --no-dry-run to send
+SUBSTACK_ENABLE_WRITE=true substack comments report 111                              # dry-run: prints request, no network call
+SUBSTACK_ENABLE_WRITE=true substack comments report 111 --category spam --details "scam account" --yes
+SUBSTACK_ENABLE_WRITE=true substack comments report 111 --publication-id 42 --yes   # include publication_id in body (no resolver — find via DevTools)
+SUBSTACK_ENABLE_WRITE=true substack comments report-user 456 --category impersonation --details "fake account" --yes
+SUBSTACK_ENABLE_WRITE=true substack comments ban 555 --user-id 777 --expiry 1y --visibility visible --yes
+SUBSTACK_ENABLE_WRITE=true substack comments ban 555 --user-id 777 --expiry 1000y --visibility delete_all_comments --yes   # 1000y = Forever; irreversible
+substack comments bans 777                                                           # list bans for a user (read-only)
+substack moderation report-categories                                                # GET Substack's reportCategory tree (read-only)
+substack moderation delete-reasons                                                   # GET comment deletion reason codes (read-only)
 ```
 
 ### Notes

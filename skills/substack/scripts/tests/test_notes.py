@@ -17,8 +17,10 @@ from substack_cli.notes import (
     _normalize_comment_id,
     _parse_schedule,
     _text_to_note_doc,
+    _validate_url,
     create_note,
     create_note_image_attachment,
+    create_note_link_attachment,
     delete_note,
     get_note,
     list_draft_notes,
@@ -573,6 +575,203 @@ def test_cli_create_missing_image_errors_without_publishing(
     )
     assert result.exit_code != 0
     assert "Image file not found" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Link attachments (--link)
+# ---------------------------------------------------------------------------
+
+LINK_URL = "https://charliepgarcia.substack.com/p/some-post"
+LINK_UUID = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+
+
+def test_validate_url_accepts_http_and_https():
+    _validate_url("http://example.com")
+    _validate_url("https://example.com/path?q=1")
+
+
+def test_validate_url_rejects_non_http():
+    with pytest.raises(ValueError, match="http"):
+        _validate_url("ftp://example.com")
+    with pytest.raises(ValueError, match="http"):
+        _validate_url("not-a-url")
+
+
+@respx.mock
+def test_create_note_link_attachment_posts_correct_body(
+    fake_cookies, fake_publication_url
+):
+    """create_note_link_attachment sends {url, type:'link'} to /api/v1/comment/attachment."""
+    route = respx.post(f"{SUBSTACK_COM}/api/v1/comment/attachment").mock(
+        return_value=httpx.Response(200, json={"id": LINK_UUID, "type": "post", "post": {}})
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    result = create_note_link_attachment(client, LINK_URL)
+    assert result == LINK_UUID
+    sent = json.loads(route.calls[0].request.content)
+    assert sent == {"url": LINK_URL, "type": "link"}
+
+
+@respx.mock
+def test_create_note_link_attachment_raises_on_missing_id(
+    fake_cookies, fake_publication_url
+):
+    respx.post(f"{SUBSTACK_COM}/api/v1/comment/attachment").mock(
+        return_value=httpx.Response(200, json={"type": "link"})  # no id
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    with pytest.raises(SubstackApiError, match="no 'id' field"):
+        create_note_link_attachment(client, LINK_URL)
+
+
+def test_create_note_link_attachment_rejects_invalid_url(
+    fake_cookies, fake_publication_url
+):
+    """No HTTP routes needed: URL validation fires before any network call."""
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    with pytest.raises(ValueError, match="http"):
+        create_note_link_attachment(client, "not-a-url")
+
+
+@respx.mock
+def test_create_note_with_link_sends_attachment_id(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env
+):
+    attach = respx.post(f"{SUBSTACK_COM}/api/v1/comment/attachment").mock(
+        return_value=httpx.Response(200, json={"id": LINK_UUID, "type": "post"})
+    )
+    feed = respx.post(f"{SUBSTACK_COM}/api/v1/comment/feed").mock(
+        return_value=httpx.Response(200, json={"id": 88})
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    result = create_note(client, text="Check this out", link_urls=[LINK_URL])
+    assert result == {"id": 88}
+    assert attach.call_count == 1
+    sent = json.loads(feed.calls[0].request.content)
+    assert sent["attachmentIds"] == [LINK_UUID]
+
+
+@respx.mock
+def test_create_note_link_and_image_ordering(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env, note_image
+):
+    """Image attachment ids come before link attachment ids in attachmentIds."""
+    # upload + image-attachment route
+    respx.post(f"{SUBSTACK_COM}/api/v1/image").mock(
+        return_value=httpx.Response(200, json={"url": CDN_URL, "imageWidth": 10})
+    )
+    attach = respx.post(f"{SUBSTACK_COM}/api/v1/comment/attachment").mock(
+        side_effect=[
+            httpx.Response(200, json={"id": "img-id"}),   # image attachment
+            httpx.Response(200, json={"id": "lnk-id"}),   # link attachment
+        ]
+    )
+    feed = respx.post(f"{SUBSTACK_COM}/api/v1/comment/feed").mock(
+        return_value=httpx.Response(200, json={"id": 99})
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    create_note(client, text="Both", image_paths=[note_image], link_urls=[LINK_URL])
+    sent = json.loads(feed.calls[0].request.content)
+    assert sent["attachmentIds"] == ["img-id", "lnk-id"]
+
+
+@respx.mock
+def test_create_note_with_link_as_draft_sends_to_comment_draft(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env
+):
+    respx.post(f"{SUBSTACK_COM}/api/v1/comment/attachment").mock(
+        return_value=httpx.Response(200, json={"id": LINK_UUID})
+    )
+    draft = respx.post(f"{SUBSTACK_COM}/api/v1/comment/draft").mock(
+        return_value=httpx.Response(200, json={"id": 10, "status": "draft"})
+    )
+    feed = respx.post(f"{SUBSTACK_COM}/api/v1/comment/feed").mock(
+        return_value=httpx.Response(200, json={"id": 1})
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    result = create_note(client, text="Draft with link", link_urls=[LINK_URL], draft=True)
+    assert result == {"id": 10, "status": "draft"}
+    assert not feed.called
+    sent = json.loads(draft.calls[0].request.content)
+    assert sent["attachmentIds"] == [LINK_UUID]
+
+
+def test_create_note_invalid_link_fails_before_any_http(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env
+):
+    """No respx routes: an invalid --link URL must raise before any network call."""
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    with pytest.raises(ValueError, match="http"):
+        create_note(client, text="x", link_urls=["not-a-url"])
+
+
+def test_create_note_no_link_omits_attachment_ids_when_no_images(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env
+):
+    """Regression: no link_urls and no image_paths -> no attachmentIds key.
+    (Checked without HTTP mocking; we hit the write gate before network.)"""
+    # Already covered by test_create_note_without_images_omits_attachment_ids,
+    # but confirm link_urls=[] is equivalent.
+    import respx as _respx
+    with _respx.mock:
+        feed = _respx.post(f"{SUBSTACK_COM}/api/v1/comment/feed").mock(
+            return_value=httpx.Response(200, json={"id": 1})
+        )
+        client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+        create_note(client, text="Plain", link_urls=[])
+        assert "attachmentIds" not in json.loads(feed.calls[0].request.content)
+
+
+# ---------------------------------------------------------------------------
+# CLI --link flag tests
+# ---------------------------------------------------------------------------
+
+@respx.mock
+def test_cli_create_with_link_flag(
+    isolated_config, authed_env, write_enabled_env, cli_runner
+):
+    respx.post(f"{SUBSTACK_COM}/api/v1/comment/attachment").mock(
+        return_value=httpx.Response(200, json={"id": LINK_UUID, "type": "post"})
+    )
+    feed = respx.post(f"{SUBSTACK_COM}/api/v1/comment/feed").mock(
+        return_value=httpx.Response(200, json={"id": 101})
+    )
+    result = cli_runner.invoke(
+        notes_app, ["create", "Read this", "--link", LINK_URL, "--yes"]
+    )
+    assert result.exit_code == 0, result.output
+    sent = json.loads(feed.calls[0].request.content)
+    assert sent["attachmentIds"] == [LINK_UUID]
+
+
+@respx.mock
+def test_cli_create_with_link_draft(
+    isolated_config, authed_env, write_enabled_env, cli_runner
+):
+    respx.post(f"{SUBSTACK_COM}/api/v1/comment/attachment").mock(
+        return_value=httpx.Response(200, json={"id": LINK_UUID})
+    )
+    draft = respx.post(f"{SUBSTACK_COM}/api/v1/comment/draft").mock(
+        return_value=httpx.Response(200, json={"id": 20, "status": "draft"})
+    )
+    result = cli_runner.invoke(
+        notes_app, ["create", "Draft link", "--link", LINK_URL, "--draft"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout.strip())["id"] == 20
+    sent = json.loads(draft.calls[0].request.content)
+    assert sent["attachmentIds"] == [LINK_UUID]
+
+
+def test_cli_create_invalid_link_errors_without_publishing(
+    isolated_config, authed_env, write_enabled_env, cli_runner
+):
+    """No respx routes: an invalid --link URL must fail before any HTTP call."""
+    result = cli_runner.invoke(
+        notes_app, ["create", "x", "--link", "ftp://bad", "--yes"]
+    )
+    assert result.exit_code != 0
+    assert "http" in result.output.lower()
 
 
 
