@@ -35,6 +35,7 @@ from substack_cli.moderation_core import (
     get_report_categories,
     get_user_bans,
     report_comment,
+    report_note_reply,
     report_user_profile,
 )
 
@@ -108,6 +109,17 @@ def comments_report_cmd(
         None, "--report-context",
         help="Optional JSON string for report_context (shape unknown; omit in most cases).",
     ),
+    surface: str = typer.Option(
+        "publication",
+        "--surface",
+        help=(
+            "Which host to report against. "
+            "'publication' (default) posts to your publication subdomain — use for "
+            "post comments. "
+            "'notes' posts to substack.com (host A) — use for notes and note replies, "
+            "which live on substack.com, not on your publication host."
+        ),
+    ),
     no_dry_run: bool = typer.Option(
         False,
         "--no-dry-run",
@@ -116,7 +128,16 @@ def comments_report_cmd(
     ),
     pretty: bool = typer.Option(False, "--pretty"),
 ):
-    """Report a comment by ID. Dry-run by default (prints request without sending)."""
+    """Report a comment or note reply by ID. Dry-run by default.
+
+    Use --surface notes for note replies (they live on substack.com, not the
+    publication host). Use --surface publication (default) for post comments.
+    """
+    if surface not in ("publication", "notes"):
+        emit_error(
+            f"Invalid --surface {surface!r}. Must be 'publication' or 'notes'.",
+            pretty=pretty,
+        )
     if not is_write_enabled():
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
     if category not in VALID_CATEGORIES:
@@ -131,19 +152,29 @@ def comments_report_cmd(
             category, details, to_substack, publication_id, report_context
         )
 
-        # Build URL from publication URL without making any HTTP call.
-        pub_url = resolve_publication_url()
-        url = f"{pub_url}/api/v1/comment/{comment_id}/report"
+        if surface == "notes":
+            # Note replies live on substack.com (host A), not the publication host.
+            url = f"{SUBSTACK_COM}/api/v1/comment/{comment_id}/report"
+        else:
+            # Build URL from publication URL without making any HTTP call.
+            pub_url = resolve_publication_url()
+            url = f"{pub_url}/api/v1/comment/{comment_id}/report"
 
         if not no_dry_run:
             _dry_run_output("POST", url, body, pretty=pretty)
             return
 
         client = _make_client()
-        result = report_comment(
-            client, comment_id, category, details, to_substack, publication_id,
-            report_context,
-        )
+        if surface == "notes":
+            result = report_note_reply(
+                client, comment_id, category, details, to_substack, publication_id,
+                report_context,
+            )
+        else:
+            result = report_comment(
+                client, comment_id, category, details, to_substack, publication_id,
+                report_context,
+            )
         output(result, pretty=pretty)
 
     except (SubstackApiError, AuthError, ValueError) as exc:
