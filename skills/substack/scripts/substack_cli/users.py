@@ -8,9 +8,9 @@ live-test required before closing #27.
 """
 from __future__ import annotations
 
-import typer  # noqa: F401 — kept for type annotations if needed
+import typer
 
-from substack_cli.app import app, users_app
+from substack_cli.app import app, users_app  # noqa: F401 — app imported for side-effect
 from substack_cli.auth import (
     AuthError,
     is_write_enabled,
@@ -25,8 +25,7 @@ from substack_cli.client import (
     output,
 )
 from substack_cli.user_blocks import (
-    _BLOCK_PATH,
-    _BLOCKS_LIST_PATH,
+    BLOCK_PATH,
     block_user,
     build_block_body,
     get_blocks,
@@ -39,8 +38,16 @@ from substack_cli.user_blocks import (
 
 
 def _make_client() -> SubstackClient:
+    """Resolve auth and create a client for user-block operations.
+
+    All block endpoints use host "A" (substack.com), so a publication URL is
+    NOT required — fall back to SUBSTACK_COM when none is configured.
+    """
     cookies = resolve_cookies()
-    pub_url = resolve_publication_url()
+    try:
+        pub_url = resolve_publication_url()
+    except AuthError:
+        pub_url = SUBSTACK_COM
     return SubstackClient(cookies=cookies, publication_url=pub_url)
 
 
@@ -86,7 +93,7 @@ def users_block_cmd(
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
 
     try:
-        path = _BLOCK_PATH.format(user_id=user_id)
+        path = BLOCK_PATH.format(user_id=user_id)
         url = f"{SUBSTACK_COM}{path}"
         body = build_block_body(user_id)
 
@@ -130,11 +137,11 @@ def users_unblock_cmd(
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
 
     try:
-        path = _BLOCK_PATH.format(user_id=user_id)
+        path = BLOCK_PATH.format(user_id=user_id)
         url = f"{SUBSTACK_COM}{path}"
 
         if not no_dry_run:
-            _dry_run_output("DELETE", url, {}, pretty=pretty)
+            _dry_run_output("DELETE", url, None, pretty=pretty)
             return
 
         client = _make_client()

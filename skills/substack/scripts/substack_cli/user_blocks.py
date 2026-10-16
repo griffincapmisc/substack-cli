@@ -24,10 +24,10 @@ from substack_cli.client import SUBSTACK_COM, SubstackClient
 # ---------------------------------------------------------------------------
 
 #: POST / DELETE — host A, per user id
-_BLOCK_PATH = "/api/v1/user/{user_id}/block"
+BLOCK_PATH = "/api/v1/user/{user_id}/block"
 
 #: GET — returns the authenticated user's block list
-_BLOCKS_LIST_PATH = "/api/v1/user/blocks"
+BLOCKS_LIST_PATH = "/api/v1/user/blocks"
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ def block_user(client: SubstackClient, user_id: int) -> dict:
     """
     if not is_write_enabled():
         raise ValueError("Write operations require SUBSTACK_ENABLE_WRITE=true")
-    path = _BLOCK_PATH.format(user_id=user_id)
+    path = BLOCK_PATH.format(user_id=user_id)
     body = build_block_body(user_id)
     return client.post(path, host="A", json_body=body)
 
@@ -69,7 +69,7 @@ def unblock_user(client: SubstackClient, user_id: int) -> dict:
     """
     if not is_write_enabled():
         raise ValueError("Write operations require SUBSTACK_ENABLE_WRITE=true")
-    path = _BLOCK_PATH.format(user_id=user_id)
+    path = BLOCK_PATH.format(user_id=user_id)
     return client.delete(path, host="A")
 
 
@@ -78,4 +78,4 @@ def get_blocks(client: SubstackClient) -> dict:
 
     Read-only — no write gate.
     """
-    return client.get(_BLOCKS_LIST_PATH, host="A")
+    return client.get(BLOCKS_LIST_PATH, host="A")
