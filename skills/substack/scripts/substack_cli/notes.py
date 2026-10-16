@@ -39,6 +39,7 @@ references/substack-api.md § Notes.
 import json
 import os
 import re
+import sys
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
@@ -129,41 +130,63 @@ def _normalize_descendants(entries: list) -> list:
 _NOTE_ALLOWED_MARKS = frozenset({"link"})
 
 
-def _strip_unsupported_note_marks(nodes: list) -> list:
+def _strip_unsupported_note_marks(nodes: list, *, _warned: set | None = None) -> list:
     """Remove ProseMirror marks that the Notes API does not accept.
 
     `strong` (`**bold**`) and `em` (`*italic*`) caused HTTP 500 on the
     Notes draft endpoint (issue #31, Oct 2026). Only `link` marks are
     confirmed safe. Unsupported marks are stripped and their text is kept as
     plain text; a warning is printed to stderr for each mark type removed.
-    """
-    import sys
 
-    warned: set = set()
+    Recurses into any node that has a ``content`` list so marks are stripped
+    at all depths (e.g. inside list items, blockquotes, nested paragraphs).
+    """
+    if _warned is None:
+        _warned = set()
     result = []
     for node in nodes:
-        if node.get("type") != "text":
-            result.append(node)
-            continue
-        marks = node.get("marks", [])
-        if not marks:
-            result.append(node)
-            continue
-        kept = [m for m in marks if m.get("type") in _NOTE_ALLOWED_MARKS]
-        stripped = [m["type"] for m in marks if m.get("type") not in _NOTE_ALLOWED_MARKS]
-        for mark_type in stripped:
-            if mark_type not in warned:
-                print(
-                    f"Warning: '{mark_type}' marks are not supported by the Notes API "
-                    "and have been removed. Use plain text or --body-json for rich formatting.",
-                    file=sys.stderr,
+        node_type = node.get("type")
+        if node_type == "text":
+            marks = node.get("marks", [])
+            if marks:
+                kept = [m for m in marks if m.get("type") in _NOTE_ALLOWED_MARKS]
+                stripped = [m["type"] for m in marks if m.get("type") not in _NOTE_ALLOWED_MARKS]
+                for mark_type in stripped:
+                    if mark_type not in _warned:
+                        print(
+                            f"Warning: '{mark_type}' marks are not supported by the Notes API "
+                            "and have been removed. Use plain text or --body-json for rich formatting.",
+                            file=sys.stderr,
+                        )
+                        _warned.add(mark_type)
+                new_node = {"type": "text", "text": node["text"]}
+                if kept:
+                    new_node["marks"] = kept
+                result.append(new_node)
+            else:
+                result.append(node)
+        else:
+            # Recurse into any node that carries a content list (paragraphs,
+            # list items, blockquotes, etc.) so marks are stripped at all depths.
+            if "content" in node and isinstance(node["content"], list):
+                node = dict(node)
+                node["content"] = _strip_unsupported_note_marks(
+                    node["content"], _warned=_warned
                 )
-                warned.add(mark_type)
-        new_node = {"type": "text", "text": node["text"]}
-        if kept:
-            new_node["marks"] = kept
-        result.append(new_node)
+            result.append(node)
     return result
+
+
+def _strip_unsupported_marks_from_doc(doc: dict) -> dict:
+    """Apply _strip_unsupported_note_marks to every content node in a doc.
+
+    Returns a shallow copy of *doc* with its ``content`` list recursively
+    stripped. Safe to call on docs produced by either _text_to_note_doc or
+    _load_body_json.
+    """
+    if not isinstance(doc.get("content"), list):
+        return doc
+    return {**doc, "content": _strip_unsupported_note_marks(doc["content"])}
 
 
 def _text_to_note_doc(text: str) -> dict:
@@ -373,7 +396,7 @@ def create_note(
         )
     _validate_reply_minimum_role(reply_minimum_role)
     if body_json is not None:
-        doc = _load_body_json(body_json)
+        doc = _strip_unsupported_marks_from_doc(_load_body_json(body_json))
     elif text is not None:
         doc = _text_to_note_doc(text)
     else:
@@ -416,7 +439,7 @@ def reply_to_note(
         )
     _validate_reply_minimum_role(reply_minimum_role)
     if body_json is not None:
-        doc = _load_body_json(body_json)
+        doc = _strip_unsupported_marks_from_doc(_load_body_json(body_json))
     elif text is not None:
         doc = _text_to_note_doc(text)
     else:
