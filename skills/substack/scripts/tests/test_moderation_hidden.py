@@ -133,7 +133,7 @@ def test_format_item_extracts_link():
 
 
 def test_format_item_preserves_raw():
-    result = _format_item(_SAMPLE_ITEM)
+    result = _format_item(_SAMPLE_ITEM, include_raw=True)
     assert result["_raw"] == _SAMPLE_ITEM
 
 
@@ -257,6 +257,22 @@ def test_get_hidden_comments_empty_list(
     client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
     result = get_hidden_comments(client)
     assert result == []
+
+
+@respx.mock
+def test_get_hidden_comments_unrecognised_envelope_returns_empty(
+    fake_cookies, fake_publication_url, isolated_config, authed_env, capsys
+):
+    """Unrecognised dict envelope → returns [] and warns to stderr."""
+    respx.get(_HIDDEN_URL).mock(
+        return_value=httpx.Response(200, json={"unknown_key": "surprise"})
+    )
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    result = get_hidden_comments(client)
+    assert result == []
+    captured = capsys.readouterr()
+    assert "Warning" in captured.err
+    assert "unrecognised" in captured.err
 
 
 @respx.mock

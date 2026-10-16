@@ -78,34 +78,40 @@ def parse_since(since: Optional[str]) -> Optional[datetime.datetime]:
         )
 
 
-def _format_item(raw: dict) -> dict:
+def _format_item(raw_item: dict, *, include_raw: bool = False) -> dict:
     """Project a raw hidden-comment object into the audit-friendly shape.
 
     Because the endpoint is unverified we cannot know the exact field names
     the API will return; we pass the raw object through and layer our
     projected fields on top.  Missing fields fall back gracefully to None.
+
+    Args:
+        raw_item: the raw dict returned by the API for a single item.
+        include_raw: when True, include the full raw API dict under ``_raw``.
     """
-    author_obj = raw.get("author") or raw.get("commenter") or {}
+    author_obj = raw_item.get("author") or raw_item.get("commenter") or {}
     subscriber_state = (
-        raw.get("subscriber_state")
-        or raw.get("subscriberState")
+        raw_item.get("subscriber_state")
+        or raw_item.get("subscriberState")
         or author_obj.get("subscriberState")
     )
-    return {
-        "id": raw.get("id"),
-        "type": raw.get("type", "comment"),
-        "author_id": raw.get("author_id") or author_obj.get("id"),
-        "author_name": raw.get("author_name") or author_obj.get("name"),
-        "author_handle": raw.get("author_handle") or author_obj.get("handle"),
+    result = {
+        "id": raw_item.get("id"),
+        "type": raw_item.get("type", "comment"),
+        "author_id": raw_item.get("author_id") or author_obj.get("id"),
+        "author_name": raw_item.get("author_name") or author_obj.get("name"),
+        "author_handle": raw_item.get("author_handle") or author_obj.get("handle"),
         "subscriber_state": subscriber_state,
-        "text": raw.get("body") or raw.get("text") or raw.get("bodyText"),
-        "reason": raw.get("automod_reason") or raw.get("reason") or raw.get("hidden_reason"),
-        "hidden_at": raw.get("hidden_at") or raw.get("created_at"),
-        "post_id": raw.get("post_id") or raw.get("postId"),
-        "post_slug": raw.get("post_slug") or raw.get("slug"),
-        "link": raw.get("url") or raw.get("link"),
-        "_raw": raw,
+        "text": raw_item.get("body") or raw_item.get("text") or raw_item.get("bodyText"),
+        "reason": raw_item.get("automod_reason") or raw_item.get("reason") or raw_item.get("hidden_reason"),
+        "hidden_at": raw_item.get("hidden_at") or raw_item.get("created_at"),
+        "post_id": raw_item.get("post_id") or raw_item.get("postId"),
+        "post_slug": raw_item.get("post_slug") or raw_item.get("slug"),
+        "link": raw_item.get("url") or raw_item.get("link"),
     }
+    if include_raw:
+        result["_raw"] = raw_item
+    return result
 
 
 def _parse_ts(ts: Optional[str]) -> Optional[datetime.datetime]:
@@ -126,6 +132,7 @@ def get_hidden_comments(
     client: SubstackClient,
     since: Optional[str] = None,
     limit: int = 100,
+    include_raw: bool = False,
 ) -> list[dict]:
     """Fetch AutoMod-hidden comments from the publication moderation endpoint.
 
@@ -158,19 +165,41 @@ def get_hidden_comments(
                 items = raw[key]
                 break
         else:
-            items = [raw]
+            import sys
+            known = ("comments", "hidden_comments", "items", "results", "data")
+            print(
+                f"Warning: unrecognised API envelope (keys: {list(raw.keys())!r}); "
+                f"expected one of {known}. Returning empty list.",
+                file=sys.stderr,
+            )
+            items = []
     else:
         items = []
 
-    projected = [_format_item(item) for item in items]
+    projected = [_format_item(item, include_raw=include_raw) for item in items]
 
     # Client-side time filter as a safety net if the server ignores `since`
     if cutoff is not None:
-        projected = [
-            p for p in projected
-            if _parse_ts(p.get("hidden_at")) is None  # keep items with no timestamp
-            or (_parse_ts(p.get("hidden_at")) or datetime.datetime.min.replace(
-                tzinfo=datetime.timezone.utc)) >= cutoff
-        ]
+        def _keep(p: dict) -> bool:
+            ts = _parse_ts(p.get("hidden_at"))
+            return ts is None or ts >= cutoff  # keep items with no timestamp
+
+        projected = [p for p in projected if _keep(p)]
+
+        # Warn if the filter had no effect because no items have timestamps
+        if projected and all(p.get("hidden_at") is None for p in projected):
+            import sys
+            print(
+                "Warning: --since filter is set but all items have no hidden_at "
+                "timestamp; filter had no effect.",
+                file=sys.stderr,
+            )
+
+    if len(projected) == limit:
+        import sys
+        print(
+            f"Note: result count equals --limit ({limit}); there may be more items.",
+            file=sys.stderr,
+        )
 
     return projected

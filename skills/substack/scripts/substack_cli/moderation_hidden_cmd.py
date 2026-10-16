@@ -22,7 +22,7 @@ def moderation_hidden_cmd(
         None,
         "--since",
         help=(
-            "Only show comments hidden after this point. "
+            "Only show post comments hidden after this point. "
             "Accepts shorthand (1h, 6h, 12h, 24h, 48h, 7d) "
             "or an ISO-8601 datetime (e.g. 2026-10-12T00:00:00Z)."
         ),
@@ -33,8 +33,9 @@ def moderation_hidden_cmd(
         help="Maximum number of results to request from the API.",
     ),
     pretty: bool = typer.Option(False, "--pretty"),
+    raw: bool = typer.Option(False, "--raw", help="Include full raw API response in each item."),
 ) -> None:
-    """List comments and note replies hidden by AutoMod or reply rules.
+    """List post comments hidden by AutoMod or reply rules.
 
     For each hidden item shows: author, subscriber status, text, AutoMod
     reason (if exposed by the API), and a link.  Read-only — no state is
@@ -46,12 +47,15 @@ def moderation_hidden_cmd(
     Capture the real path from the publication dashboard → Moderation →
     AutoMod decisions (DevTools Network tab) and update AUTOMOD_HIDDEN_PATH
     in moderation_hidden.py.
+    Note: AutoMod-hidden note replies are accessible via
+    `notes replies <id> --all` (automodHiddenBranches envelope).
+    This command covers post comments only.
     """
     try:
         cookies = resolve_cookies()
         pub_url = resolve_publication_url()
         client = SubstackClient(cookies=cookies, publication_url=pub_url)
-        items = get_hidden_comments(client, since=since, limit=limit)
+        items = get_hidden_comments(client, since=since, limit=limit, include_raw=raw)
         output(items, pretty=pretty)
     except ValueError as exc:
         emit_error(str(exc), pretty=pretty)
