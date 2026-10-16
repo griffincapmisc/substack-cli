@@ -277,3 +277,33 @@ def test_comments_report_notes_blocked_without_write_gate(
         ["report", "9001", "--category", "spam", "--surface", "notes"],
     )
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# report_note_reply — report_context forwarded to POST body
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_report_note_reply_includes_report_context_decoded(
+    fake_cookies, fake_publication_url, isolated_config, write_enabled_env
+):
+    """report_note_reply with a non-None report_context must include it decoded in the POST body."""
+    route = respx.post(
+        f"{SUBSTACK_COM}/api/v1/comment/9003/report"
+    ).mock(return_value=httpx.Response(200, json={"ok": True}))
+
+    client = SubstackClient(cookies=fake_cookies, publication_url=fake_publication_url)
+    report_note_reply(
+        client,
+        comment_id=9003,
+        category="spam",
+        details="",
+        reported_to_substack=True,
+        publication_id=None,
+        report_context='{"foo": 1}',
+    )
+
+    assert route.called
+    body = json.loads(route.calls[0].request.content)
+    assert body["report_context"] == {"foo": 1}

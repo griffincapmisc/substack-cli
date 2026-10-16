@@ -1,6 +1,7 @@
 """Substack CLI — comment moderation CLI layer (Typer commands only).
 
 Core logic, enums, and body builders live in moderation_core.py.
+Shared helpers (_make_client, _dry_run_output) live in moderation_helpers.py.
 All write commands default to dry-run unless --no-dry-run / --yes is passed.
 """
 from __future__ import annotations
@@ -13,16 +14,15 @@ from substack_cli.app import app, comments_app
 from substack_cli.auth import (
     AuthError,
     is_write_enabled,
-    resolve_cookies,
     resolve_publication_url,
 )
 from substack_cli.client import (
     SUBSTACK_COM,
     SubstackApiError,
-    SubstackClient,
     emit_error,
     output,
 )
+from substack_cli.moderation_helpers import _dry_run_output, _make_client
 from substack_cli.moderation_core import (
     VALID_CATEGORIES,
     VALID_EXPIRIES,
@@ -39,41 +39,11 @@ from substack_cli.moderation_core import (
     report_user_profile,
 )
 
-# ---------------------------------------------------------------------------
-# New top-level sub-app: moderation
-# ---------------------------------------------------------------------------
-
 moderation_app = typer.Typer(
     help="Comment moderation helpers: report categories, delete reasons.",
     no_args_is_help=True,
 )
 app.add_typer(moderation_app, name="moderation")
-
-
-# ---------------------------------------------------------------------------
-# Helper: build client
-# ---------------------------------------------------------------------------
-
-def _make_client() -> SubstackClient:
-    cookies = resolve_cookies()
-    pub_url = resolve_publication_url()
-    return SubstackClient(cookies=cookies, publication_url=pub_url)
-
-
-# ---------------------------------------------------------------------------
-# DRY-RUN helper
-# ---------------------------------------------------------------------------
-
-def _dry_run_output(method: str, url: str, body: dict, pretty: bool) -> None:
-    """Print the exact request that would be fired, then exit 0."""
-    payload = {
-        "dry_run": True,
-        "method": method,
-        "url": url,
-        "body": body,
-    }
-    output(payload, pretty=pretty)
-
 
 # ---------------------------------------------------------------------------
 # CLI: comments report
@@ -138,6 +108,7 @@ def comments_report_cmd(
             f"Invalid --surface {surface!r}. Must be 'publication' or 'notes'.",
             pretty=pretty,
         )
+        return
     if not is_write_enabled():
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
     if category not in VALID_CATEGORIES:
