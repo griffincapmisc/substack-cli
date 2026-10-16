@@ -60,28 +60,99 @@ from substack_cli.client import (
 # the same ProseMirror text-node + mark schema as newsletter posts.
 from substack_cli.publish import _parse_inline, upload_image
 
-# Notes publish for everyone to reply by default. Other known values include
-# "subscriber", "paid_subscriber", "founding". Passed through as-is.
+# Notes publish for everyone to reply by default.
+# Live-verified values: "everyone", "paid_subscriber".
+# "subscriber" was rejected by the API with 400 "Invalid value" (Oct 2026).
+# "founding" has never been tested against the live API.
 DEFAULT_REPLY_MINIMUM_ROLE = "everyone"
+
+# Only these values have been confirmed or are safe to pass through.
+# "subscriber" was rejected by the API (issue #31). "founding" is unverified.
+REPLY_MINIMUM_ROLE_CHOICES = ("everyone", "paid_subscriber")
+
+
+def _validate_reply_minimum_role(value: str) -> str:
+    """Validate --reply-min-role against the known-good set.
+
+    Raises ValueError with a descriptive message if the value is not in the
+    live-verified set. This prevents silent 400s from the API.
+    """
+    if value not in REPLY_MINIMUM_ROLE_CHOICES:
+        raise ValueError(
+            f"--reply-min-role {value!r} is not a verified API value. "
+            f"Accepted values: {', '.join(REPLY_MINIMUM_ROLE_CHOICES)}. "
+            "('subscriber' was rejected by the API with 400 in Oct 2026; "
+            "'founding' has never been verified against the live API.)"
+        )
+    return value
 
 
 # ---------------------------------------------------------------------------
 # Body builder (plain text / minimal Markdown -> ProseMirror "doc")
 # ---------------------------------------------------------------------------
 
+# Marks that the Notes API has been confirmed to accept.
+# `strong` and `em` caused 500s on POST /api/v1/comment/draft (issue #31,
+# Oct 2026). Only `link` is confirmed safe from observed live Note drafts.
+_NOTE_ALLOWED_MARKS = frozenset({"link"})
+
+
+def _strip_unsupported_note_marks(nodes: list) -> list:
+    """Remove ProseMirror marks that the Notes API does not accept.
+
+    `strong` (`**bold**`) and `em` (`*italic*`) caused HTTP 500 on the
+    Notes draft endpoint (issue #31, Oct 2026). Only `link` marks are
+    confirmed safe. Unsupported marks are stripped and their text is kept as
+    plain text; a warning is printed to stderr for each mark type removed.
+    """
+    import sys
+
+    warned: set = set()
+    result = []
+    for node in nodes:
+        if node.get("type") != "text":
+            result.append(node)
+            continue
+        marks = node.get("marks", [])
+        if not marks:
+            result.append(node)
+            continue
+        kept = [m for m in marks if m.get("type") in _NOTE_ALLOWED_MARKS]
+        stripped = [m["type"] for m in marks if m.get("type") not in _NOTE_ALLOWED_MARKS]
+        for mark_type in stripped:
+            if mark_type not in warned:
+                print(
+                    f"Warning: '{mark_type}' marks are not supported by the Notes API "
+                    "and have been removed. Use plain text or --body-json for rich formatting.",
+                    file=sys.stderr,
+                )
+                warned.add(mark_type)
+        new_node = {"type": "text", "text": node["text"]}
+        if kept:
+            new_node["marks"] = kept
+        result.append(new_node)
+    return result
+
 
 def _text_to_note_doc(text: str) -> dict:
     """Build a Note `bodyJson` ProseMirror document from plain text.
 
-    Blank lines split paragraphs; within a paragraph, inline **bold**,
-    *italic*, and [text](url) are parsed via the shared `_parse_inline`
-    helper. Raises ValueError on empty text.
+    Blank lines split paragraphs; within a paragraph, [text](url) links are
+    parsed via the shared `_parse_inline` helper. **bold** and *italic* marks
+    are stripped with a warning — the Notes API rejects `strong`/`em` marks
+    (500 on POST /api/v1/comment/draft, issue #31). Raises ValueError on
+    empty text.
     """
     blocks = [b.strip() for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
     if not blocks:
         raise ValueError("Note text cannot be empty.")
     content = [
-        {"type": "paragraph", "content": _parse_inline(block.replace("\n", " "))}
+        {
+            "type": "paragraph",
+            "content": _strip_unsupported_note_marks(
+                _parse_inline(block.replace("\n", " "))
+            ),
+        }
         for block in blocks
     ]
     # `attrs` mirrors the shape captured from the web app's create-note call.
@@ -226,6 +297,7 @@ def create_note(
             "Write operations require SUBSTACK_ENABLE_WRITE=true "
             "(env var) or enable_write: true (config)"
         )
+    _validate_reply_minimum_role(reply_minimum_role)
     if body_json is not None:
         doc = _load_body_json(body_json)
     elif text is not None:
@@ -273,6 +345,7 @@ def reply_to_note(
             "Write operations require SUBSTACK_ENABLE_WRITE=true "
             "(env var) or enable_write: true (config)"
         )
+    _validate_reply_minimum_role(reply_minimum_role)
     if body_json is not None:
         doc = _load_body_json(body_json)
     elif text is not None:
@@ -364,8 +437,9 @@ def _make_client() -> SubstackClient:
 def notes_create_cmd(
     text: str = typer.Argument(
         None,
-        help="Note text. Blank lines split paragraphs; supports **bold**, "
-        "*italic*, [text](url). Omit when using --body-json.",
+        help="Note text. Blank lines split paragraphs; supports [text](url) links. "
+        "Bold/italic are stripped with a warning (not supported by the Notes API). "
+        "Omit when using --body-json.",
     ),
     body_json: str = typer.Option(
         None,
@@ -382,7 +456,8 @@ def notes_create_cmd(
     reply_min_role: str = typer.Option(
         DEFAULT_REPLY_MINIMUM_ROLE,
         "--reply-min-role",
-        help="Who may reply: everyone | subscriber | paid_subscriber | founding.",
+        help="Who may reply: everyone | paid_subscriber. "
+        "('subscriber' was rejected by the API in Oct 2026; 'founding' is unverified.)",
     ),
     draft: bool = typer.Option(
         False,
@@ -463,8 +538,9 @@ def notes_reply_cmd(
     ),
     text: str = typer.Argument(
         None,
-        help="Reply text. Blank lines split paragraphs; supports **bold**, "
-        "*italic*, [text](url). Omit when using --body-json.",
+        help="Reply text. Blank lines split paragraphs; supports [text](url) links. "
+        "Bold/italic are stripped with a warning (not supported by the Notes API). "
+        "Omit when using --body-json.",
     ),
     body_json: str = typer.Option(
         None,
@@ -475,7 +551,8 @@ def notes_reply_cmd(
     reply_min_role: str = typer.Option(
         DEFAULT_REPLY_MINIMUM_ROLE,
         "--reply-min-role",
-        help="Who may reply: everyone | subscriber | paid_subscriber | founding.",
+        help="Who may reply: everyone | paid_subscriber. "
+        "('subscriber' was rejected by the API in Oct 2026; 'founding' is unverified.)",
     ),
     yes: bool = typer.Option(
         False, "--yes", help="Confirm publishing (notes are immediate + uneditable)."
