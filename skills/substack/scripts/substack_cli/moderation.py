@@ -1,6 +1,7 @@
 """Substack CLI — comment moderation CLI layer (Typer commands only).
 
 Core logic, enums, and body builders live in moderation_core.py.
+Shared helpers (_make_client, _dry_run_output) live in moderation_helpers.py.
 All write commands default to dry-run unless --no-dry-run / --yes is passed.
 """
 from __future__ import annotations
@@ -21,6 +22,7 @@ from substack_cli.client import (
     emit_error,
     output,
 )
+from substack_cli.moderation_helpers import _dry_run_output, _make_client, moderation_app  # noqa: F401
 from substack_cli.moderation_core import (
     VALID_CATEGORIES,
     VALID_EXPIRIES,
@@ -29,24 +31,11 @@ from substack_cli.moderation_core import (
     build_ban_body,
     build_profile_report_body,
     build_report_body,
-    dry_run_output,
-    get_delete_reasons,
-    get_report_categories,
-    get_user_bans,
-    make_client,
     report_comment,
+    report_note_reply,
     report_user_profile,
 )
 
-# ---------------------------------------------------------------------------
-# New top-level sub-app: moderation
-# ---------------------------------------------------------------------------
-
-moderation_app = typer.Typer(
-    help="Comment moderation helpers: report categories, delete reasons.",
-    no_args_is_help=True,
-)
-app.add_typer(moderation_app, name="moderation")
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +72,17 @@ def comments_report_cmd(
         None, "--report-context",
         help="Optional JSON string for report_context (shape unknown; omit in most cases).",
     ),
+    surface: str = typer.Option(
+        "publication",
+        "--surface",
+        help=(
+            "Which host to report against. "
+            "'publication' (default) posts to your publication subdomain — use for "
+            "post comments. "
+            "'notes' posts to substack.com (host A) — use for notes and note replies, "
+            "which live on substack.com, not on your publication host."
+        ),
+    ),
     no_dry_run: bool = typer.Option(
         False,
         "--no-dry-run",
@@ -91,7 +91,17 @@ def comments_report_cmd(
     ),
     pretty: bool = typer.Option(False, "--pretty"),
 ):
-    """Report a comment by ID. Dry-run by default (prints request without sending)."""
+    """Report a comment or note reply by ID. Dry-run by default.
+
+    Use --surface notes for note replies (they live on substack.com, not the
+    publication host). Use --surface publication (default) for post comments.
+    """
+    if surface not in ("publication", "notes"):
+        emit_error(
+            f"Invalid --surface {surface!r}. Must be 'publication' or 'notes'.",
+            pretty=pretty,
+        )
+        return
     if not is_write_enabled():
         emit_error("Write operations require SUBSTACK_ENABLE_WRITE=true", pretty=pretty)
         return
@@ -108,19 +118,29 @@ def comments_report_cmd(
             category, details, to_substack, publication_id, report_context
         )
 
-        # Build URL from publication URL without making any HTTP call.
-        pub_url = resolve_publication_url()
-        url = f"{pub_url}/api/v1/comment/{comment_id}/report"
+        if surface == "notes":
+            # Note replies live on substack.com (host A), not the publication host.
+            url = f"{SUBSTACK_COM}/api/v1/comment/{comment_id}/report"
+        else:
+            # Build URL from publication URL without making any HTTP call.
+            pub_url = resolve_publication_url()
+            url = f"{pub_url}/api/v1/comment/{comment_id}/report"
 
         if not no_dry_run:
-            dry_run_output("POST", url, body, pretty=pretty)
+            _dry_run_output("POST", url, body, pretty=pretty)
             return
 
-        client = make_client()
-        result = report_comment(
-            client, comment_id, category, details, to_substack, publication_id,
-            report_context,
-        )
+        client = _make_client()
+        if surface == "notes":
+            result = report_note_reply(
+                client, comment_id, category, details, to_substack, publication_id,
+                report_context,
+            )
+        else:
+            result = report_comment(
+                client, comment_id, category, details, to_substack, publication_id,
+                report_context,
+            )
         output(result, pretty=pretty)
 
     except (SubstackApiError, AuthError, ValueError) as exc:
@@ -184,10 +204,10 @@ def comments_report_user_cmd(
         url = f"{SUBSTACK_COM}/api/v1/users/{user_id}/profile/report"
 
         if not no_dry_run:
-            dry_run_output("POST", url, body, pretty=pretty)
+            _dry_run_output("POST", url, body, pretty=pretty)
             return
 
-        client = make_client()
+        client = _make_client()
         result = report_user_profile(
             client, user_id, category, details, to_substack, report_context
         )
@@ -259,10 +279,10 @@ def comments_ban_cmd(
         url = f"{pub_url}/api/v1/comment_ban/{comment_id}"
 
         if not no_dry_run:
-            dry_run_output("POST", url, body, pretty=pretty)
+            _dry_run_output("POST", url, body, pretty=pretty)
             return
 
-        client = make_client()
+        client = _make_client()
         result = ban_commenter(client, comment_id, user_id, expiry, visibility)
         output(result, pretty=pretty)
 
@@ -271,60 +291,3 @@ def comments_ban_cmd(
     except Exception as exc:
         emit_error(f"Unexpected error: {exc}", pretty=pretty)
 
-
-# ---------------------------------------------------------------------------
-# CLI: comments bans  (READ-ONLY)
-# ---------------------------------------------------------------------------
-
-@comments_app.command("bans")
-def comments_bans_cmd(
-    user_id: int = typer.Argument(..., help="User ID to look up bans for."),
-    pretty: bool = typer.Option(False, "--pretty"),
-):
-    """List existing bans for a user (read-only). GET /api/v1/user/{user_id}/bans."""
-    try:
-        client = make_client()
-        result = get_user_bans(client, user_id)
-        output(result, pretty=pretty)
-    except (SubstackApiError, AuthError) as exc:
-        emit_error(str(exc), status_code=getattr(exc, "status_code", None), pretty=pretty)
-    except Exception as exc:
-        emit_error(f"Unexpected error: {exc}", pretty=pretty)
-
-
-# ---------------------------------------------------------------------------
-# CLI: moderation report-categories  (READ-ONLY)
-# ---------------------------------------------------------------------------
-
-@moderation_app.command("report-categories")
-def moderation_report_categories_cmd(
-    pretty: bool = typer.Option(False, "--pretty"),
-):
-    """Fetch Substack's reporting flow tree (report categories). Read-only."""
-    try:
-        client = make_client()
-        result = get_report_categories(client)
-        output(result, pretty=pretty)
-    except (SubstackApiError, AuthError) as exc:
-        emit_error(str(exc), status_code=getattr(exc, "status_code", None), pretty=pretty)
-    except Exception as exc:
-        emit_error(f"Unexpected error: {exc}", pretty=pretty)
-
-
-# ---------------------------------------------------------------------------
-# CLI: moderation delete-reasons  (READ-ONLY)
-# ---------------------------------------------------------------------------
-
-@moderation_app.command("delete-reasons")
-def moderation_delete_reasons_cmd(
-    pretty: bool = typer.Option(False, "--pretty"),
-):
-    """Fetch comment deletion reason codes. Read-only."""
-    try:
-        client = make_client()
-        result = get_delete_reasons(client)
-        output(result, pretty=pretty)
-    except (SubstackApiError, AuthError) as exc:
-        emit_error(str(exc), status_code=getattr(exc, "status_code", None), pretty=pretty)
-    except Exception as exc:
-        emit_error(f"Unexpected error: {exc}", pretty=pretty)

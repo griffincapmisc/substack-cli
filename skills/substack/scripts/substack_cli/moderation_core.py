@@ -9,8 +9,8 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from substack_cli.auth import is_write_enabled, resolve_cookies, resolve_publication_url
-from substack_cli.client import SubstackClient, output
+from substack_cli.auth import is_write_enabled
+from substack_cli.client import SubstackClient
 
 # ---------------------------------------------------------------------------
 # Validated enum values
@@ -34,27 +34,6 @@ VALID_VISIBILITIES = {"visible", "delete_this_comment", "delete_all_comments"}
 # expiry values confirmed from bundle module 92538 (ban modal "Ban duration"
 # select). "1000y" is the UI's "Forever".
 VALID_EXPIRIES = {"1d", "30d", "90d", "1y", "1000y"}
-
-
-# ---------------------------------------------------------------------------
-# Client and dry-run helpers (shared with CLI layer)
-# ---------------------------------------------------------------------------
-
-def make_client() -> SubstackClient:
-    cookies = resolve_cookies()
-    pub_url = resolve_publication_url()
-    return SubstackClient(cookies=cookies, publication_url=pub_url)
-
-
-def dry_run_output(method: str, url: str, body: dict, pretty: bool) -> None:
-    """Print the exact request that would be fired, then exit 0."""
-    payload = {
-        "dry_run": True,
-        "method": method,
-        "url": url,
-        "body": body,
-    }
-    output(payload, pretty=pretty)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +122,37 @@ def report_comment(
         category, details, reported_to_substack, publication_id, report_context
     )
     return client.post(f"/api/v1/comment/{comment_id}/report", json_body=body)
+
+
+def report_note_reply(
+    client: SubstackClient,
+    comment_id: int,
+    category: str,
+    details: str,
+    reported_to_substack: bool,
+    publication_id: Optional[int],
+    report_context: Optional[str],
+) -> dict:
+    """Report a note or note reply via POST https://substack.com/api/v1/comment/{id}/report.
+
+    Note replies live on substack.com (host "A"), not on the publication host.
+    The endpoint path is identical to report_comment but the host differs.
+    """
+    if not is_write_enabled():
+        raise ValueError("Write operations require SUBSTACK_ENABLE_WRITE=true")
+    if category not in VALID_CATEGORIES:
+        raise ValueError(
+            f"Invalid category {category!r}. "
+            f"Valid values: {sorted(VALID_CATEGORIES)}"
+        )
+    body = build_report_body(
+        category, details, reported_to_substack, publication_id, report_context
+    )
+    return client.post(
+        f"/api/v1/comment/{comment_id}/report",
+        host="A",
+        json_body=body,
+    )
 
 
 def report_user_profile(
