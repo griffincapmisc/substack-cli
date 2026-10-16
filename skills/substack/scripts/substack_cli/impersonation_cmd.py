@@ -11,11 +11,11 @@ from __future__ import annotations
 import typer
 
 from substack_cli.app import app
-from substack_cli.impersonation import (
+from substack_cli.impersonation import run_cli
+from substack_cli.impersonation_state import (
     DEFAULT_DAILY_CAP,
     DEFAULT_NOTES_LIMIT,
     DEFAULT_POST_LIMIT,
-    run_cli,
 )
 
 impersonation_app = typer.Typer(
@@ -47,7 +47,7 @@ def scan_cmd(
         "--dry-run/--no-dry-run",
         help=(
             "Dry-run mode (default ON): print would-be report calls, no POSTs. "
-            "To fire real reports, set SUBSTACK_ENABLE_WRITE=true AND pass --no-dry-run."
+            "Live reporting is not yet implemented; --no-dry-run will refuse with an error."
         ),
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Print progress to stdout."),
@@ -55,8 +55,8 @@ def scan_cmd(
     """Scan recent posts and Notes for impersonation of Charlie Garcia.
 
     In dry-run mode (default), prints {dry_run, method, url, body} for each
-    candidate — zero network writes. Real reporting requires both
-    SUBSTACK_ENABLE_WRITE=true (env) AND --no-dry-run flag.
+    candidate — zero network writes. Live reporting is not yet implemented;
+    --no-dry-run refuses with an error.
 
     State files written to ~/.afk/state/impersonation/:
       seen.json           — persistent dedupe of acted user_ids

@@ -13,13 +13,11 @@ from substack_cli.app import app, comments_app
 from substack_cli.auth import (
     AuthError,
     is_write_enabled,
-    resolve_cookies,
     resolve_publication_url,
 )
 from substack_cli.client import (
     SUBSTACK_COM,
     SubstackApiError,
-    SubstackClient,
     emit_error,
     output,
 )
@@ -31,9 +29,11 @@ from substack_cli.moderation_core import (
     build_ban_body,
     build_profile_report_body,
     build_report_body,
+    dry_run_output,
     get_delete_reasons,
     get_report_categories,
     get_user_bans,
+    make_client,
     report_comment,
     report_user_profile,
 )
@@ -47,31 +47,6 @@ moderation_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(moderation_app, name="moderation")
-
-
-# ---------------------------------------------------------------------------
-# Helper: build client
-# ---------------------------------------------------------------------------
-
-def _make_client() -> SubstackClient:
-    cookies = resolve_cookies()
-    pub_url = resolve_publication_url()
-    return SubstackClient(cookies=cookies, publication_url=pub_url)
-
-
-# ---------------------------------------------------------------------------
-# DRY-RUN helper
-# ---------------------------------------------------------------------------
-
-def _dry_run_output(method: str, url: str, body: dict, pretty: bool) -> None:
-    """Print the exact request that would be fired, then exit 0."""
-    payload = {
-        "dry_run": True,
-        "method": method,
-        "url": url,
-        "body": body,
-    }
-    output(payload, pretty=pretty)
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +113,10 @@ def comments_report_cmd(
         url = f"{pub_url}/api/v1/comment/{comment_id}/report"
 
         if not no_dry_run:
-            _dry_run_output("POST", url, body, pretty=pretty)
+            dry_run_output("POST", url, body, pretty=pretty)
             return
 
-        client = _make_client()
+        client = make_client()
         result = report_comment(
             client, comment_id, category, details, to_substack, publication_id,
             report_context,
@@ -209,10 +184,10 @@ def comments_report_user_cmd(
         url = f"{SUBSTACK_COM}/api/v1/users/{user_id}/profile/report"
 
         if not no_dry_run:
-            _dry_run_output("POST", url, body, pretty=pretty)
+            dry_run_output("POST", url, body, pretty=pretty)
             return
 
-        client = _make_client()
+        client = make_client()
         result = report_user_profile(
             client, user_id, category, details, to_substack, report_context
         )
@@ -284,10 +259,10 @@ def comments_ban_cmd(
         url = f"{pub_url}/api/v1/comment_ban/{comment_id}"
 
         if not no_dry_run:
-            _dry_run_output("POST", url, body, pretty=pretty)
+            dry_run_output("POST", url, body, pretty=pretty)
             return
 
-        client = _make_client()
+        client = make_client()
         result = ban_commenter(client, comment_id, user_id, expiry, visibility)
         output(result, pretty=pretty)
 
@@ -308,7 +283,7 @@ def comments_bans_cmd(
 ):
     """List existing bans for a user (read-only). GET /api/v1/user/{user_id}/bans."""
     try:
-        client = _make_client()
+        client = make_client()
         result = get_user_bans(client, user_id)
         output(result, pretty=pretty)
     except (SubstackApiError, AuthError) as exc:
@@ -327,7 +302,7 @@ def moderation_report_categories_cmd(
 ):
     """Fetch Substack's reporting flow tree (report categories). Read-only."""
     try:
-        client = _make_client()
+        client = make_client()
         result = get_report_categories(client)
         output(result, pretty=pretty)
     except (SubstackApiError, AuthError) as exc:
@@ -346,7 +321,7 @@ def moderation_delete_reasons_cmd(
 ):
     """Fetch comment deletion reason codes. Read-only."""
     try:
-        client = _make_client()
+        client = make_client()
         result = get_delete_reasons(client)
         output(result, pretty=pretty)
     except (SubstackApiError, AuthError) as exc:

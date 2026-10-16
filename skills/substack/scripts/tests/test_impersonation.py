@@ -47,13 +47,15 @@ import os
 import pytest
 import unittest.mock as mock
 
-from substack_cli.impersonation import (
+from substack_cli.impersonation_detect import (
     ALLOWLISTED_USER_IDS,
     REAL_CHARLIE_USER_ID,
     _detect,
     _normalize_for_detection,
     _has_non_ascii_confusable,
     _body_has_contact_lure,
+)
+from substack_cli.impersonation_state import (
     _walk_comments,
     _record_candidate,
     _load_seen,
@@ -482,7 +484,7 @@ class TestRecordCandidate:
         candidates, uncertain = [], []
         state = {"acted_user_ids": [], "daily_counts": {"2026-10-15": 20}}
         acted = set()
-        with mock.patch("substack_cli.impersonation._today", return_value="2026-10-15"):
+        with mock.patch("substack_cli.impersonation_state._today", return_value="2026-10-15"):
             _record_candidate(
                 candidates, uncertain, acted, state,
                 user_id=888, name="Cap Test",
@@ -588,3 +590,17 @@ class TestRemovePrefix:
         assert "cc-12345".removeprefix("c-") == "cc-12345"
         # Contrast: "cc-12345".lstrip("c-") would return "12345" (wrong)
         assert "cc-12345".lstrip("c-") == "12345"
+
+
+# ---------------------------------------------------------------------------
+# Item 2 — --no-dry-run refuses with error
+# ---------------------------------------------------------------------------
+
+class TestNoDryRunRefuses:
+    def test_no_dry_run_refuses_with_error(self):
+        """dry_run=False → SystemExit(1) with error message"""
+        from substack_cli.impersonation import run_scan
+        client = mock.MagicMock()
+        with pytest.raises(SystemExit) as exc_info:
+            run_scan(client, post_limit=0, notes_limit=0, dry_run=False)
+        assert exc_info.value.code == 1

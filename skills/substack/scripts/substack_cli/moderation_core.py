@@ -9,8 +9,8 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from substack_cli.auth import is_write_enabled
-from substack_cli.client import SubstackClient
+from substack_cli.auth import is_write_enabled, resolve_cookies, resolve_publication_url
+from substack_cli.client import SubstackClient, output
 
 # ---------------------------------------------------------------------------
 # Validated enum values
@@ -34,6 +34,27 @@ VALID_VISIBILITIES = {"visible", "delete_this_comment", "delete_all_comments"}
 # expiry values confirmed from bundle module 92538 (ban modal "Ban duration"
 # select). "1000y" is the UI's "Forever".
 VALID_EXPIRIES = {"1d", "30d", "90d", "1y", "1000y"}
+
+
+# ---------------------------------------------------------------------------
+# Client and dry-run helpers (shared with CLI layer)
+# ---------------------------------------------------------------------------
+
+def make_client() -> SubstackClient:
+    cookies = resolve_cookies()
+    pub_url = resolve_publication_url()
+    return SubstackClient(cookies=cookies, publication_url=pub_url)
+
+
+def dry_run_output(method: str, url: str, body: dict, pretty: bool) -> None:
+    """Print the exact request that would be fired, then exit 0."""
+    payload = {
+        "dry_run": True,
+        "method": method,
+        "url": url,
+        "body": body,
+    }
+    output(payload, pretty=pretty)
 
 
 # ---------------------------------------------------------------------------
