@@ -114,7 +114,7 @@ def run_scan(
         print(f"[scan] Fetching archive (limit={post_limit}) …")
 
     try:
-        archive = client.get("/api/v1/archive", sort="new", offset=0, limit=post_limit)
+        archive = client.get("/api/v1/archive", sort="new", limit=post_limit)
         posts = archive if isinstance(archive, list) else archive.get("posts", [])
     except Exception as exc:
         posts = []

@@ -67,29 +67,31 @@ def test_full_draft_lifecycle_create_prepublish_publish(authed_env, write_enable
 
 @respx.mock
 def test_archive_pagination_across_two_pages(authed_env):
-    """Fetch page 1, then page 2 using offset."""
+    """Fetch page 1, then page 2 using the nextCursor the server returned."""
     page1 = [{"id": i, "title": f"Post {i}"} for i in range(1, 6)]
     page2 = [{"id": i, "title": f"Post {i}"} for i in range(6, 11)]
 
     route = respx.get(f"{PUB_URL}/api/v1/archive").mock(
         side_effect=[
-            httpx.Response(200, json=page1),
-            httpx.Response(200, json=page2),
+            httpx.Response(200, json={"posts": page1, "nextCursor": "abc"}),
+            httpx.Response(200, json={"posts": page2, "nextCursor": None}),
         ]
     )
 
     runner = CliRunner()
 
-    result = runner.invoke(app, ["archive", "--limit", "5", "--offset", "0"])
+    result = runner.invoke(app, ["archive", "--limit", "5"])
     assert result.exit_code == 0
     items1 = json.loads(result.stdout.strip())
     assert len(items1) == 5
+    assert "offset" not in route.calls[0].request.url.params
 
-    result = runner.invoke(app, ["archive", "--limit", "5", "--offset", "5"])
+    result = runner.invoke(app, ["archive", "--limit", "5", "--cursor", "abc"])
     assert result.exit_code == 0
     items2 = json.loads(result.stdout.strip())
     assert len(items2) == 5
     assert items2[0]["id"] == 6
+    assert route.calls[1].request.url.params["cursor"] == "abc"
 
 
 @respx.mock

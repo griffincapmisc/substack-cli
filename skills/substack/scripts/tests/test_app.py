@@ -74,7 +74,7 @@ def test_uncaught_exception_becomes_json_error_never_a_traceback(
     def _boom(*_args, **_kwargs):
         raise ValueError("Internal explosion")
 
-    monkeypatch.setattr(read_module, "get_archive", _boom)
+    monkeypatch.setattr(read_module, "get_archive_page", _boom)
 
     runner = CliRunner()
     result = runner.invoke(app, ["archive"])

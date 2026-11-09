@@ -59,6 +59,33 @@ def _make_leaderboard_client() -> SubstackClient:
 # ---------------------------------------------------------------------------
 
 
+def get_archive_page(
+    client: SubstackClient,
+    *,
+    sort: str = "new",
+    limit: int = 25,
+    search: Optional[str] = None,
+    cursor: Optional[str] = None,
+) -> tuple:
+    """Fetch one page of the archive. Returns (posts, next_cursor).
+
+    /api/v1/archive is cursor-paginated: the server rejects any `offset`
+    query param with 400 ("Invalid value") and instead returns an opaque
+    `nextCursor` in the envelope, which must be passed back as `cursor=`
+    to fetch the following page. `limit` is capped server-side at 25.
+    next_cursor is None for a bare-array response or when there is no
+    further page."""
+    params: dict = {"sort": sort, "limit": limit}
+    if search is not None:
+        params["search"] = search
+    if cursor:
+        params["cursor"] = cursor
+    data = client.get("/api/v1/archive", **params)
+    posts = extract_list(data, "posts")
+    next_cursor = data.get("nextCursor") if isinstance(data, dict) else None
+    return posts, next_cursor
+
+
 def get_archive(
     client: SubstackClient,
     *,
@@ -66,14 +93,16 @@ def get_archive(
     offset: int = 0,
     limit: int = 25,
     search: Optional[str] = None,
+    cursor: Optional[str] = None,
 ) -> list:
     """List published posts from the archive. Uses /api/v1/archive (singular).
-    Tolerates both bare-array and {posts, hasMore} envelope shapes via extract_list."""
-    params: dict = {"sort": sort, "offset": offset, "limit": limit}
-    if search is not None:
-        params["search"] = search
-    data = client.get("/api/v1/archive", **params)
-    return extract_list(data, "posts")
+    Tolerates both bare-array and {posts, nextCursor} envelope shapes via extract_list.
+
+    `offset` is accepted for backward compatibility only and is NEVER sent
+    to the API (Substack now rejects it). Use `cursor` / get_archive_page()
+    to page."""
+    posts, _ = get_archive_page(client, sort=sort, limit=limit, search=search, cursor=cursor)
+    return posts
 
 
 def list_categories(client: SubstackClient) -> list:
@@ -584,7 +613,7 @@ def get_posts_analytics(
     gracefully: a post whose detail call fails is kept with stats={}."""
     if sort not in _STAT_SORT_FIELDS:
         raise ValueError(f"sort must be one of: {', '.join(_STAT_SORT_FIELDS)}")
-    posts = get_archive(client, sort="new", offset=0, limit=limit)
+    posts = get_archive(client, sort="new", limit=limit)
     ranked: list = []
     for post in posts:
         if not isinstance(post, dict):
@@ -634,16 +663,39 @@ def get_digest(client: SubstackClient, *, top: int = 5) -> dict:
 @app.command("archive")
 def archive_cmd(
     sort: str = "new",
-    offset: int = 0,
-    limit: int = 25,
+    offset: int = typer.Option(
+        0,
+        "--offset",
+        help="DEPRECATED: ignored. Substack's archive is cursor-paginated; use --cursor.",
+    ),
+    limit: int = typer.Option(25, "--limit", help="Posts per page (server max 25)."),
     search: str = None,
+    cursor: str = typer.Option(
+        None,
+        "--cursor",
+        help="Opaque nextCursor from a previous page (printed to stderr) to fetch the next page.",
+    ),
     pretty: bool = False,
 ):
-    """List published posts from the archive. Public — works without auth."""
+    """List published posts from the archive. Public — works without auth.
+
+    Paging: the server returns an opaque nextCursor, which this command prints
+    to stderr as `nextCursor: <value>`; pass it back via --cursor. stdout is
+    always the JSON list of posts only."""
     try:
+        if offset:
+            print(
+                "warning: --offset is deprecated and ignored (Substack rejects it); "
+                "use --cursor for paging",
+                file=sys.stderr,
+            )
         client = _make_client(anonymous=True)
-        result = get_archive(client, sort=sort, offset=offset, limit=limit, search=search)
+        result, next_cursor = get_archive_page(
+            client, sort=sort, limit=limit, search=search, cursor=cursor
+        )
         output_list(result, pretty=pretty, title="Archive")
+        if next_cursor:
+            print(f"nextCursor: {next_cursor}", file=sys.stderr)
     except (SubstackApiError, AuthError) as exc:
         emit_error(str(exc), status_code=getattr(exc, "status_code", None), pretty=pretty)
     except Exception as exc:
